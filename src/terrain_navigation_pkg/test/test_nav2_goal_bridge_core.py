@@ -20,6 +20,7 @@ from terrain_navigation_pkg.nav2_goal_bridge_core import (
     should_focus_rolling_waypoint,
     should_handoff_virtual_preview_after_waypoint,
     should_promote_near_goal_route_abort,
+    should_retry_aborted_rolling_segment,
     should_retry_rolling_preview_as_current_only,
 )
 
@@ -336,6 +337,21 @@ def test_aborted_rolling_preview_retries_current_waypoint_only_once():
     assert not should_retry_rolling_preview_as_current_only(5, 2, 3, False)
     assert not should_retry_rolling_preview_as_current_only(
         6, 2, None, False
+    )
+
+
+def test_aborted_current_rolling_segment_preserves_route_for_retry():
+    assert should_retry_aborted_rolling_segment(
+        6, True, 'rolling_segment', 2, True, False
+    )
+    assert not should_retry_aborted_rolling_segment(
+        5, True, 'rolling_segment', 2, True, False
+    )
+    assert not should_retry_aborted_rolling_segment(
+        6, False, 'rolling_segment', 2, True, False
+    )
+    assert not should_retry_aborted_rolling_segment(
+        6, True, 'rolling_segment', 2, True, True
     )
 
 

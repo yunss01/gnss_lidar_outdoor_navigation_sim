@@ -21,6 +21,8 @@
   <exec_depend>nav2_smoother</exec_depend>
   <exec_depend>nav2_velocity_smoother</exec_depend>
   <exec_depend>nav2_waypoint_follower</exec_depend>
+  <exec_depend>robot_localization</exec_depend>
+  <exec_depend>ouster_ros</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>config_pkg</exec_depend>
   <exec_depend>terrain_navigation_pkg</exec_depend>

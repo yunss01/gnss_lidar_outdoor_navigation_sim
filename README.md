@@ -1,4 +1,14 @@
-# GNSS LiDAR Outdoor Navigation
+# GNSS LiDAR Outdoor Navigation — Simulation
+
+저장소: https://github.com/yunss01/gnss_lidar_outdoor_navigation_sim
+
+이 저장소는 `terrain_nav_ws`의 시뮬레이션·평가 코드와 개발 이력을 관리합니다.
+실차 개발은 독립 작업공간 `terrain_real_ws`와 다음 저장소에서 진행합니다:
+https://github.com/yunss01/gnss_lidar_outdoor_navigation_real
+
+기존 하드웨어 인터페이스와 관련 launch 파일은 이력 및 호환성을 위해
+남겨 두었지만, 새 실차 작업공간이 이 저장소를 overlay/import하지는 않습니다.
+저장소 분리 때문에 기존 패키지 이름이나 시뮬레이션 실행 명령을 바꾸지 않습니다.
 
 GNSS 웨이포인트와 3D LiDAR를 활용한 실외 자율주행 ROS 2 워크스페이스입니다.
 
@@ -29,6 +39,7 @@ GNSS 웨이포인트와 3D LiDAR를 활용한 실외 자율주행 ROS 2 워크�
 ## Build
 
 ```bash
+git clone https://github.com/yunss01/gnss_lidar_outdoor_navigation_sim.git ~/terrain_nav_ws
 cd ~/terrain_nav_ws
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install

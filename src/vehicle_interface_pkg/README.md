@@ -19,13 +19,38 @@ The initial assignment follows the 2026 H-Mobility training material:
 | Device | Arduino Mega pin |
 |---|---|
 | Steering motor driver IN1 / IN2 | D2 / D3 |
-| Right rear motor driver IN1 / IN2 | D4 / D5 |
-| Left rear motor driver IN1 / IN2 | D6 / D7 |
-| Steering potentiometer OUT | A2 |
+| Right rear motor driver IN1 / IN2 | D8 / D9 |
+| Left rear motor driver IN1 / IN2 | D7 / D6 |
+| Steering potentiometer OUT | A0 |
 | Steering potentiometer power | 5V / GND |
 
-Change these constants at the top of `terrain_vehicle_controller.ino` if the
-physical wiring changes.
+This is the pin assignment and serial protocol used by
+`~/dynamic_obstacle_ws/src/control/driving/driving.ino`. Change the constants
+at the top of `terrain_vehicle_controller.ino` if the physical wiring changes.
+
+## Steering calibration
+
+The reference firmware accepts a desired steering step in the range `-7..+7`.
+On the current vehicle, full physical left, centre, and full physical right are
+represented by `-7`, `0`, and `+7`, respectively.  ROS maps its positive-left
+yaw convention to those firmware values using editable parameters in
+`config_pkg/config/params.yaml`:
+
+```yaml
+wheelbase_m: 0.80
+maximum_steering_angle_deg: 20.0
+maximum_steering_step: 7
+steering_left_command: -7
+steering_center_command: 0
+steering_right_command: 7
+```
+
+The three command values may be changed after bench calibration without
+changing Python code. `maximum_steering_angle_deg` is currently a symmetric
+left/right estimate and should also be replaced after measuring a turning
+circle. The firmware potentiometer endpoints (`POTENTIOMETER_MOST_LEFT` and
+`POTENTIOMETER_MOST_RIGHT`) remain firmware constants and require re-uploading
+the sketch when changed.
 
 ## Build and dry-run
 

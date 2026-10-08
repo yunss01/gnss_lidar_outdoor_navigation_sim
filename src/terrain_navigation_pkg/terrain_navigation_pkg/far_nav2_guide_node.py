@@ -2,6 +2,7 @@
 
 import csv
 from datetime import datetime
+import json
 import math
 from pathlib import Path
 import time
@@ -24,12 +25,15 @@ from .far_guide_core import assess_active_replan
 from .far_guide_core import bounded_heading_preference
 from .far_guide_core import can_accept_bounded_topology_escape
 from .far_guide_core import can_accept_length_only_detour
+from .far_guide_core import is_actionable_safety_stop
 from .far_guide_core import nearest_polyline_tangent
 from .far_guide_core import plan_online_guide
 from .far_guide_core import polylines_similar
 from .far_guide_core import prefix_polyline_to_point
 from .far_guide_core import remaining_polyline_length
 from .far_guide_core import retry_lookahead_distance
+from .far_guide_core import SafetyReplanHold
+from .far_guide_core import SafetyRejectionMonitor
 from .far_guide_core import select_direction_continuity
 from .far_guide_core import select_subgoal
 from .far_guide_core import should_request_costmap_recovery
@@ -168,6 +172,16 @@ class FarNav2GuideNode(Node):
         self.declare_parameter('stuck_costmap_recovery_cooldown_s', 10.0)
         self.declare_parameter('safety_state_topic', '/safety/state')
         self.declare_parameter('safety_state_timeout_s', 1.5)
+        self.declare_parameter(
+            'safety_trajectory_rejection_topic',
+            '/safety/trajectory_rejection',
+        )
+        self.declare_parameter('safety_rejection_replanning_enabled', True)
+        self.declare_parameter('safety_rejection_confirmations', 3)
+        self.declare_parameter('safety_rejection_window_s', 1.0)
+        self.declare_parameter('safety_rejection_minimum_goal_age_s', 0.5)
+        self.declare_parameter('safety_replan_clear_confirmations', 3)
+        self.declare_parameter('safety_replan_maximum_hold_s', 1.0)
         self.declare_parameter(
             'local_costmap_clear_service',
             '/local_costmap/clear_around_local_costmap',
@@ -402,6 +416,30 @@ class FarNav2GuideNode(Node):
         self.safety_state_timeout_s = float(
             self.get_parameter('safety_state_timeout_s').value
         )
+        self.safety_rejection_replanning_enabled = bool(
+            self.get_parameter(
+                'safety_rejection_replanning_enabled'
+            ).value
+        )
+        self.safety_rejection_confirmations = int(
+            self.get_parameter('safety_rejection_confirmations').value
+        )
+        self.safety_rejection_window_s = float(
+            self.get_parameter('safety_rejection_window_s').value
+        )
+        self.safety_rejection_minimum_goal_age_s = float(
+            self.get_parameter(
+                'safety_rejection_minimum_goal_age_s'
+            ).value
+        )
+        self.safety_replan_clear_confirmations = int(
+            self.get_parameter(
+                'safety_replan_clear_confirmations'
+            ).value
+        )
+        self.safety_replan_maximum_hold_s = float(
+            self.get_parameter('safety_replan_maximum_hold_s').value
+        )
         self.grid_stride = int(self.get_parameter('grid_stride').value)
         self.lethal_cost_threshold = float(
             self.get_parameter('lethal_cost_threshold').value
@@ -524,6 +562,20 @@ class FarNav2GuideNode(Node):
             raise ValueError('costmap recovery distance must be positive')
         if self.safety_state_timeout_s <= 0.0:
             raise ValueError('safety state timeout must be positive')
+        if self.safety_rejection_confirmations < 1:
+            raise ValueError(
+                'safety rejection confirmations must be positive'
+            )
+        if self.safety_rejection_window_s <= 0.0:
+            raise ValueError('safety rejection window must be positive')
+        if self.safety_rejection_minimum_goal_age_s < 0.0:
+            raise ValueError('safety rejection minimum goal age is invalid')
+        if self.safety_replan_clear_confirmations < 1:
+            raise ValueError(
+                'safety replan clear confirmations must be positive'
+            )
+        if self.safety_replan_maximum_hold_s <= 0.0:
+            raise ValueError('safety replan maximum hold must be positive')
         if not (
             0.0 < self.path_efficiency_retry_min_lookahead_m
             <= self.segment_lookahead_m
@@ -620,6 +672,14 @@ class FarNav2GuideNode(Node):
             reliable_qos,
         )
         self.create_subscription(
+            String,
+            str(self.get_parameter(
+                'safety_trajectory_rejection_topic'
+            ).value),
+            self._on_safety_trajectory_rejection,
+            reliable_qos,
+        )
+        self.create_subscription(
             PathMessage,
             str(self.get_parameter('nav2_plan_topic').value),
             self._on_nav2_plan,
@@ -664,6 +724,14 @@ class FarNav2GuideNode(Node):
         self.latest_path_validity_wall_time = None
         self.latest_safety_state = None
         self.latest_safety_state_wall_time = None
+        self.safety_rejection_monitor = SafetyRejectionMonitor(
+            self.safety_rejection_confirmations,
+            self.safety_rejection_window_s,
+        )
+        self.safety_replan_hold = SafetyReplanHold(
+            self.safety_replan_clear_confirmations,
+            self.safety_replan_maximum_hold_s,
+        )
         self.pending_replan_reason = None
         self.pending_replan_subgoal_xy = None
         self.pending_replan_count = 0
@@ -814,6 +882,8 @@ class FarNav2GuideNode(Node):
         self._clear_leg_direction()
         self._clear_failed_corridors()
         self._reset_path_efficiency_retry(reset_topology_escape=True)
+        self._reset_safety_rejection_monitor()
+        self.safety_replan_hold.reset()
         self.consecutive_segment_aborts = 0
         tangent_status = 'tangent=undefined'
         if self.latest_goal_tangent_yaw_rad is not None:
@@ -835,6 +905,8 @@ class FarNav2GuideNode(Node):
         self._clear_leg_direction()
         self._clear_failed_corridors()
         self._reset_path_efficiency_retry(reset_topology_escape=True)
+        self._reset_safety_rejection_monitor()
+        self.safety_replan_hold.reset()
         self.consecutive_segment_aborts = 0
         self._publish_status('mission_waypoint_reached')
         self._log('mission_waypoint_reached')
@@ -847,6 +919,89 @@ class FarNav2GuideNode(Node):
     def _on_safety_state(self, message):
         self.latest_safety_state = str(message.data)
         self.latest_safety_state_wall_time = time.monotonic()
+        self.safety_replan_hold.observe_state(self.latest_safety_state)
+
+    def _reset_safety_rejection_monitor(self):
+        self.safety_rejection_monitor.reset()
+
+    def _on_safety_trajectory_rejection(self, message):
+        """Replace a persistently unsafe controller trajectory promptly.
+
+        The raw-LiDAR node remains authoritative and continues commanding
+        zero speed.  This callback only feeds that already-enforced stop back
+        to FAR so it can abandon the rejected guide before Nav2's 15 second
+        progress timeout and search a different corridor.
+        """
+
+        if not self.safety_rejection_replanning_enabled:
+            return
+        if (
+            self.active_goal_handle is None
+            or self.active_goal_started_wall_time is None
+            or self.cancel_in_flight
+        ):
+            self._reset_safety_rejection_monitor()
+            return
+        now = time.monotonic()
+        safety_state_age_s = (
+            float('inf')
+            if self.latest_safety_state_wall_time is None
+            else now - self.latest_safety_state_wall_time
+        )
+        # A trajectory-rejection message is also emitted while the safety
+        # controller deliberately crawls through obstacle_recovery.  Only a
+        # fresh, actual obstacle_stop is allowed to discard a Nav2 segment;
+        # caution/recovery are already safe, usable commands.
+        if not is_actionable_safety_stop(
+            self.latest_safety_state,
+            safety_state_age_s,
+            self.safety_state_timeout_s,
+        ):
+            self._reset_safety_rejection_monitor()
+            return
+        if (
+            now - self.active_goal_started_wall_time
+            < self.safety_rejection_minimum_goal_age_s
+        ):
+            return
+        try:
+            payload = json.loads(message.data)
+            if payload.get('reason') != 'obstacle_stop':
+                return
+            cloud_stamp_ns = int(payload.get('cloud_stamp_ns', 0))
+            cloud_sequence = int(payload.get('cloud_sequence', 0))
+            evidence_id = (
+                cloud_stamp_ns
+                if cloud_stamp_ns > 0
+                else -cloud_sequence
+            )
+            if evidence_id == 0:
+                return
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not self.safety_rejection_monitor.observe(now, evidence_id):
+            return
+        diagnostic = (
+            'confirmations={};window_s={:.2f};cloud_stamp_ns={};'
+            'curvature_per_m={};stop_points={}'.format(
+                self.safety_rejection_monitor.count,
+                self.safety_rejection_window_s,
+                cloud_stamp_ns,
+                payload.get('curvature_per_m', ''),
+                payload.get('nominal_stop_point_count', ''),
+            )
+        )
+        self._publish_status('safety_rejection_replanning')
+        self._log(
+            'safety_trajectory_rejection_replan',
+            action_status=diagnostic,
+        )
+        self.get_logger().warning(
+            'Persistent swept-trajectory rejection; replacing FAR segment: '
+            + diagnostic
+        )
+        self._reset_safety_rejection_monitor()
+        self._cancel_active_goal('safety_trajectory_rejection')
 
     def _vehicle_speed_mps(self):
         if self.latest_odometry is None:
@@ -1317,6 +1472,7 @@ class FarNav2GuideNode(Node):
             return
         if reason in (
             'active_replan',
+            'safety_trajectory_rejection',
             'inefficient_path',
             'inefficient_path_alternate',
             'inefficient_path_exhausted',
@@ -1326,6 +1482,7 @@ class FarNav2GuideNode(Node):
             )
         if reason in (
             'active_replan',
+            'safety_trajectory_rejection',
             'inefficient_path_alternate',
             'inefficient_path_exhausted',
         ):
@@ -1358,14 +1515,27 @@ class FarNav2GuideNode(Node):
             self.active_guide_path = None
             self.active_subgoal_xy = None
         self._reset_replan_monitor()
+        self._reset_safety_rejection_monitor()
         self.cancel_in_flight = False
-        if reason == 'inefficient_path_exhausted':
+        now = time.monotonic()
+        if reason == 'safety_trajectory_rejection':
+            self.safety_replan_hold.arm(now)
+            self.next_plan_wall_time = now
+            diagnostic = 'clear_confirmations={};maximum_hold_s={:.2f}'.format(
+                self.safety_replan_clear_confirmations,
+                self.safety_replan_maximum_hold_s,
+            )
+            self._publish_status('safety_replan_waiting_for_clear')
+            self._log('safety_replan_hold_started', action_status=diagnostic)
+        elif reason == 'inefficient_path_exhausted':
+            self.safety_replan_hold.reset()
             self.next_plan_wall_time = max(
-                time.monotonic(),
+                now,
                 self.path_efficiency_blocked_until_wall_time,
             )
         else:
-            self.next_plan_wall_time = time.monotonic() + 0.1
+            self.safety_replan_hold.reset()
+            self.next_plan_wall_time = now + 0.1
         self._log('segment_canceled_' + reason)
 
     def _inputs_ready(self):
@@ -1549,6 +1719,20 @@ class FarNav2GuideNode(Node):
             or self.costmap_recovery_pending > 0
         ):
             return
+        if self.safety_replan_hold.active:
+            release_reason = self.safety_replan_hold.release_reason(now)
+            if release_reason is None:
+                return
+            diagnostic = 'reason={};clear_count={};elapsed_s={:.3f}'.format(
+                release_reason,
+                self.safety_replan_hold.clear_count,
+                now - self.safety_replan_hold.started_s,
+            )
+            self.safety_replan_hold.reset()
+            self._publish_status('safety_replan_hold_released')
+            self._log(
+                'safety_replan_hold_released', action_status=diagnostic
+            )
         if now < self.next_plan_wall_time or now < self.hold_until_wall_time:
             return
         if now < self.path_efficiency_blocked_until_wall_time:
@@ -1855,6 +2039,7 @@ class FarNav2GuideNode(Node):
         self.latest_path_hard_valid = None
         self.latest_path_validity_wall_time = None
         self._reset_replan_monitor()
+        self._reset_safety_rejection_monitor()
         self._publish_status('following_far_segment')
         self._publish_nav2_status('navigating')
         self._log('segment_accepted')
@@ -1898,6 +2083,7 @@ class FarNav2GuideNode(Node):
             self.active_guide_path = None
             self.active_subgoal_xy = None
         self._reset_replan_monitor()
+        self._reset_safety_rejection_monitor()
         self.cancel_in_flight = False
         self._publish_nav2_status('nav2_result_{}'.format(status))
         self._log('segment_result', action_status=status)

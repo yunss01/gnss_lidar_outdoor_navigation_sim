@@ -198,6 +198,31 @@ def should_retry_rolling_preview_as_current_only(
     return not bool(already_focused)
 
 
+def should_retry_aborted_rolling_segment(
+    status: int,
+    is_current: bool,
+    goal_mode: str,
+    route_window_start,
+    route_available: bool,
+    pending_goal_exists: bool,
+) -> bool:
+    """Keep an F9/F10 mission alive after one Nav2 segment aborts.
+
+    A failed required replan must stop the controller, but it must not discard
+    the saved route.  Only retry the currently authoritative one-pose rolling
+    segment.  Canceled/superseded goals and explicit waypoint handoffs already
+    have a pending replacement and must never be resurrected here.
+    """
+    return bool(
+        int(status) == 6
+        and is_current
+        and goal_mode == 'rolling_segment'
+        and route_window_start is not None
+        and route_available
+        and not pending_goal_exists
+    )
+
+
 def should_handoff_virtual_preview_after_waypoint(
     route_pose_count: int,
     route_real_pose_count: int,

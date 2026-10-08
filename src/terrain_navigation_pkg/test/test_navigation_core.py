@@ -28,6 +28,41 @@ def test_geodetic_to_enu_small_east_and_north_offsets():
     assert abs(east.north_m) < 0.01
 
 
+def test_carla_mercator_matches_simulator_equatorial_scale():
+    origin = GeodeticPoint(0.0, 0.0, 10.0)
+    offset = geodetic_to_enu(
+        GeodeticPoint(0.0001, 0.0001, 12.5),
+        origin,
+        'carla_mercator',
+    )
+
+    # CARLA's legacy Mercator georeference uses the WGS84 semi-major radius
+    # in both planar axes at the equator (about 11.132 m per 0.0001 degree).
+    assert offset.east_m == pytest.approx(11.13195, abs=0.0001)
+    assert offset.north_m == pytest.approx(11.13195, abs=0.0001)
+    assert offset.up_m == pytest.approx(2.5)
+
+
+def test_wgs84_remains_default_and_differs_from_carla_north_scale():
+    origin = GeodeticPoint(0.0, 0.0, 0.0)
+    point = GeodeticPoint(0.0001, 0.0, 0.0)
+
+    production = geodetic_to_enu(point, origin)
+    simulator = geodetic_to_enu(point, origin, 'carla_mercator')
+
+    assert production.north_m == pytest.approx(11.05743, abs=0.0001)
+    assert simulator.north_m - production.north_m > 0.07
+
+
+def test_geodetic_to_enu_rejects_unknown_projection():
+    with pytest.raises(ValueError, match='projection_mode'):
+        geodetic_to_enu(
+            GeodeticPoint(37.0, 127.0),
+            GeodeticPoint(37.0, 127.0),
+            'automatic',
+        )
+
+
 def test_median_geodetic_point_rejects_single_outlier():
     points = [
         GeodeticPoint(37.000000, 127.000000, 10.0),

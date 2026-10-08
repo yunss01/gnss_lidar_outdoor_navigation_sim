@@ -28,7 +28,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import Imu, PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, Float32, String, UInt32
 
@@ -39,11 +39,13 @@ from .navigation_learning_recorder_core import (
     quaternion_to_yaw,
     world_to_vehicle_xy,
 )
+from .traversability_evidence_core import VALID_DISPOSITIONS
 
 
 CSV_FIELDS = [
     'sample_id', 'wall_time_iso', 'ros_time_s', 'cloud_stamp_s',
-    'cloud_age_s', 'odom_age_s', 'file', 'route_status', 'route_index',
+    'cloud_age_s', 'semantic_cloud_stamp_s', 'semantic_alignment_delta_s',
+    'imu_age_s', 'odom_age_s', 'file', 'route_status', 'route_index',
     'route_size', 'vehicle_x', 'vehicle_y', 'vehicle_z', 'vehicle_yaw',
     'speed_mps', 'goal_vehicle_x', 'goal_vehicle_y', 'goal_vehicle_z',
     'teacher_subgoal_x', 'teacher_subgoal_y', 'nav2_cmd_speed',
@@ -55,8 +57,68 @@ CSV_FIELDS = [
 ]
 
 
+def path_hard_valid_subscription_qos():
+    """Match the clearance validator's reliable, volatile publisher QoS."""
+
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=5,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+
 def _stamp_seconds(stamp):
     return float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+
+
+def perception_capture_readiness(
+    latest,
+    latest_wall,
+    *,
+    now,
+    maximum_cloud_age_s,
+    maximum_odometry_age_s,
+    require_semantic_cloud,
+    maximum_semantic_alignment_s,
+):
+    """Return whether every input required to save a sample is ready."""
+
+    cloud = latest.get('cloud')
+    if cloud is None:
+        return False, 'waiting_for_geometric_cloud'
+    odometry = latest.get('odom')
+    if odometry is None:
+        return False, 'waiting_for_odometry'
+    cloud_age = now - latest_wall.get('cloud', -math.inf)
+    if cloud_age > maximum_cloud_age_s:
+        return False, 'geometric_cloud_stale'
+    odometry_age = now - latest_wall.get('odom', -math.inf)
+    if odometry_age > maximum_odometry_age_s:
+        return False, 'odometry_stale'
+    if not require_semantic_cloud:
+        return True, 'ready'
+    semantic_cloud = latest.get('semantic_cloud')
+    if semantic_cloud is None:
+        return False, 'waiting_for_semantic_cloud'
+    semantic_age = now - latest_wall.get('semantic_cloud', -math.inf)
+    if semantic_age > maximum_cloud_age_s:
+        return False, 'semantic_cloud_stale'
+    alignment_delta = abs(
+        _stamp_seconds(semantic_cloud.header.stamp)
+        - _stamp_seconds(cloud.header.stamp)
+    )
+    if alignment_delta > maximum_semantic_alignment_s:
+        return False, 'semantic_cloud_not_aligned'
+    return True, 'ready'
+
+
+def perception_capture_completion_result(queued_samples):
+    """Never report a zero-sample perception session as completed."""
+
+    if int(queued_samples) <= 0:
+        return 'perception_capture_failed_no_samples'
+    return 'perception_capture_completed'
 
 
 def _json_write(path, value):
@@ -92,6 +154,32 @@ class NavigationLearningRecorder(Node):
         self.save_sample_files = bool(
             self.get_parameter('save_sample_files').value
         )
+        self.save_semantic_labels = bool(
+            self.get_parameter('save_semantic_labels').value
+        )
+        self.maximum_semantic_alignment_s = float(
+            self.get_parameter('maximum_semantic_alignment_s').value
+        )
+        self.controlled_traversability_actors = (
+            self._controlled_traversability_actor_policy()
+        )
+        self.maximum_imu_age_s = float(
+            self.get_parameter('maximum_imu_age_s').value
+        )
+        if self.save_semantic_labels:
+            if not self.save_sample_files or not self.save_raw_points:
+                raise ValueError(
+                    'semantic labels require sample files and raw points'
+                )
+            if self.maximum_semantic_alignment_s <= 0.0:
+                raise ValueError(
+                    'maximum_semantic_alignment_s must be positive'
+                )
+        elif self.controlled_traversability_actors:
+            raise ValueError(
+                'controlled traversability actor policy requires '
+                'save_semantic_labels=true'
+            )
         # A short stationary capture is kept separate from the mission
         # recorder: it starts only after fresh LiDAR and odometry arrive, then
         # closes itself after the requested duration.  This lets perception
@@ -183,6 +271,15 @@ class NavigationLearningRecorder(Node):
             'writer_queue_size': 64,
             'save_raw_points': True,
             'save_sample_files': True,
+            'save_semantic_labels': False,
+            'maximum_semantic_alignment_s': 0.03,
+            'controlled_traversability_actor_id': -1,
+            'controlled_traversability_disposition': '',
+            'controlled_traversability_blueprint': '',
+            'controlled_traversability_policy_source': (
+                'vehicle_clearance_policy'
+            ),
+            'maximum_imu_age_s': 0.2,
             'perception_capture_on_start': False,
             'perception_capture_duration_s': 15.0,
             'perception_capture_output_directory': (
@@ -197,6 +294,8 @@ class NavigationLearningRecorder(Node):
             'bev_z_max_m': 3.0,
             'bev_resolution_m': 0.25,
             'point_cloud_topic': '/lidar/points',
+            'semantic_cloud_topic': '/lidar/semantic_points',
+            'imu_topic': '/vectornav/imu',
             'odometry_topic': '/vehicle/odometry',
             'route_topic': '/navigation/waypoint_route',
             'route_status_topic': '/navigation/route_status',
@@ -223,6 +322,39 @@ class NavigationLearningRecorder(Node):
         for name, value in defaults.items():
             self.declare_parameter(name, value)
 
+    def _controlled_traversability_actor_policy(self):
+        """Return one optional controlled actor entry for session metadata."""
+        actor_id = int(
+            self.get_parameter('controlled_traversability_actor_id').value
+        )
+        disposition = str(self.get_parameter(
+            'controlled_traversability_disposition'
+        ).value).strip().lower()
+        blueprint = str(self.get_parameter(
+            'controlled_traversability_blueprint'
+        ).value).strip()
+        policy_source = str(self.get_parameter(
+            'controlled_traversability_policy_source'
+        ).value).strip()
+        if actor_id < 0:
+            if disposition or blueprint:
+                raise ValueError(
+                    'controlled actor disposition/blueprint was set without '
+                    'a non-negative controlled_traversability_actor_id'
+                )
+            return []
+        if disposition not in VALID_DISPOSITIONS:
+            raise ValueError(
+                'controlled_traversability_disposition must be one of: '
+                + ', '.join(sorted(VALID_DISPOSITIONS))
+            )
+        return [{
+            'actor_id': actor_id,
+            'disposition': disposition,
+            'blueprint': blueprint,
+            'policy_source': policy_source,
+        }]
+
     def _create_subscriptions(self):
         latched = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -236,6 +368,7 @@ class NavigationLearningRecorder(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        path_hard_valid_qos = path_hard_valid_subscription_qos()
 
         def topic(name):
             return str(self.get_parameter(name).value)
@@ -243,6 +376,15 @@ class NavigationLearningRecorder(Node):
         self.create_subscription(
             PointCloud2, topic('point_cloud_topic'),
             lambda msg: self._remember('cloud', msg), qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            PointCloud2, topic('semantic_cloud_topic'),
+            lambda msg: self._remember('semantic_cloud', msg),
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            Imu, topic('imu_topic'),
+            lambda msg: self._remember('imu', msg), qos_profile_sensor_data,
         )
         self.create_subscription(
             Odometry, topic('odometry_topic'),
@@ -276,7 +418,15 @@ class NavigationLearningRecorder(Node):
             (Twist, 'output_command_topic', 'output_command', reliable),
             (String, 'safety_state_topic', 'safety_state', reliable),
             (UInt32, 'safety_obstacle_points_topic', 'safety_points', reliable),
-            (Bool, 'path_hard_valid_topic', 'path_hard_valid', latched),
+            # The clearance validator publishes reliable/volatile Bool data.
+            # Requesting transient-local durability here is QoS-incompatible
+            # and silently leaves every recorded sample at its false default.
+            (
+                Bool,
+                'path_hard_valid_topic',
+                'path_hard_valid',
+                path_hard_valid_qos,
+            ),
             (String, 'path_clearance_status_topic', 'clearance_status', reliable),
             (String, 'nav2_status_topic', 'nav2_status', reliable),
             (String, 'far_guide_status_topic', 'far_guide_status', reliable),
@@ -391,6 +541,19 @@ class NavigationLearningRecorder(Node):
                 ],
                 'orientation': 'row 0 forward, column 0 vehicle left',
             },
+            'privileged_supervision': {
+                'semantic_labels_saved': self.save_semantic_labels,
+                'semantic_cloud_topic': str(
+                    self.get_parameter('semantic_cloud_topic').value
+                ),
+                'model_input_policy': (
+                    'semantic tags are training targets only; deployed model '
+                    'must consume geometric LiDAR, GNSS guidance, and state'
+                ),
+            },
+            'controlled_traversability_actors': (
+                self.controlled_traversability_actors
+            ),
         }
         self._writer_queue.put(('start', session_path, metadata))
         self.get_logger().info('Learning session started: %s' % session_path)
@@ -402,17 +565,21 @@ class NavigationLearningRecorder(Node):
         now = time.monotonic()
         with self._lock:
             state = self._perception_capture_state
-            cloud_available = self._latest.get('cloud') is not None
-            odom_available = self._latest.get('odom') is not None
-            cloud_age = now - self._latest_wall.get('cloud', -math.inf)
-            odom_age = now - self._latest_wall.get('odom', -math.inf)
+            ready, readiness_reason = perception_capture_readiness(
+                self._latest,
+                self._latest_wall,
+                now=now,
+                maximum_cloud_age_s=self.maximum_cloud_age,
+                maximum_odometry_age_s=self.maximum_odom_age,
+                require_semantic_cloud=self.save_semantic_labels,
+                maximum_semantic_alignment_s=(
+                    self.maximum_semantic_alignment_s
+                ),
+            )
             deadline = self._perception_capture_deadline
+            queued_samples = self._queued_samples
         if state == 'waiting':
-            if (
-                cloud_available and odom_available
-                and cloud_age <= self.maximum_cloud_age
-                and odom_age <= self.maximum_odom_age
-            ):
+            if ready:
                 self._start_session()
                 with self._lock:
                     self._perception_capture_state = 'recording'
@@ -426,10 +593,22 @@ class NavigationLearningRecorder(Node):
                     )
                 )
         elif state == 'recording' and deadline is not None and now >= deadline:
-            self._close_session('perception_capture_completed')
+            result = perception_capture_completion_result(queued_samples)
+            self._close_session(result)
             with self._lock:
-                self._perception_capture_state = 'completed'
-            self.get_logger().info('Perception capture completed')
+                self._perception_capture_state = (
+                    'completed'
+                    if result == 'perception_capture_completed'
+                    else 'failed'
+                )
+            if result == 'perception_capture_completed':
+                self.get_logger().info('Perception capture completed')
+            else:
+                self.get_logger().error(
+                    'Perception capture failed: no samples were saved. '
+                    'Check geometric/semantic LiDAR alignment and freshness; '
+                    f'last readiness={readiness_reason}'
+                )
 
     def _close_session(self, result):
         with self._lock:
@@ -473,6 +652,24 @@ class NavigationLearningRecorder(Node):
                 return
             if cloud_age > self.maximum_cloud_age or odom_age > self.maximum_odom_age:
                 return
+            semantic_cloud = self._latest.get('semantic_cloud')
+            semantic_stamp_s = math.nan
+            semantic_alignment_delta_s = math.nan
+            if self.save_semantic_labels:
+                if semantic_cloud is None:
+                    return
+                semantic_stamp_s = _stamp_seconds(
+                    semantic_cloud.header.stamp
+                )
+                semantic_alignment_delta_s = abs(
+                    semantic_stamp_s - _stamp_seconds(cloud.header.stamp)
+                )
+                if (
+                    semantic_alignment_delta_s
+                    > self.maximum_semantic_alignment_s
+                ):
+                    return
+            imu_age = now_wall - self._latest_wall.get('imu', -math.inf)
             cloud_key = (
                 cloud.header.stamp.sec, cloud.header.stamp.nanosec,
                 cloud.width, cloud.row_step,
@@ -492,6 +689,9 @@ class NavigationLearningRecorder(Node):
                 ).astimezone().isoformat(),
                 'ros_time_s': self.get_clock().now().nanoseconds * 1.0e-9,
                 'cloud_age_s': cloud_age,
+                'semantic_cloud_stamp_s': semantic_stamp_s,
+                'semantic_alignment_delta_s': semantic_alignment_delta_s,
+                'imu_age_s': imu_age,
                 'odom_age_s': odom_age,
                 'route_status': self._route_status,
                 'route_index': self._route_index,
@@ -531,6 +731,37 @@ class NavigationLearningRecorder(Node):
                     array['x'], array['y'], array['z']
                 ]).astype(np.float32, copy=False)
             return np.asarray(array, dtype=np.float32).reshape((-1, 3))
+
+    @staticmethod
+    def _semantic_cloud_arrays(message):
+        """Read the CARLA-only semantic label cloud without float-casting IDs."""
+        if message is None:
+            return (
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+                np.empty((0,), dtype=np.uint32),
+                np.empty((0,), dtype=np.uint32),
+            )
+        values = point_cloud2.read_points(
+            message,
+            field_names=[
+                'x', 'y', 'z', 'cos_incidence',
+                'object_idx', 'object_tag',
+            ],
+            skip_nans=True,
+        )
+        array = np.asarray(values)
+        if not array.dtype.names:
+            raise ValueError('semantic PointCloud2 must preserve named fields')
+        xyz = np.column_stack([
+            array['x'], array['y'], array['z'],
+        ]).astype(np.float32, copy=False)
+        return (
+            xyz,
+            np.asarray(array['cos_incidence'], dtype=np.float32),
+            np.asarray(array['object_idx'], dtype=np.uint32),
+            np.asarray(array['object_tag'], dtype=np.uint32),
+        )
 
     @staticmethod
     def _path_vehicle(message, pose):
@@ -578,6 +809,17 @@ class NavigationLearningRecorder(Node):
         lidar_bev = None
         if self.save_sample_files:
             lidar_bev = build_lidar_bev(points, self.geometry)
+        semantic_xyz = np.empty((0, 3), dtype=np.float32)
+        semantic_cosine = np.empty((0,), dtype=np.float32)
+        semantic_indices = np.empty((0,), dtype=np.uint32)
+        semantic_tags = np.empty((0,), dtype=np.uint32)
+        if self.save_semantic_labels:
+            (
+                semantic_xyz,
+                semantic_cosine,
+                semantic_indices,
+                semantic_tags,
+            ) = self._semantic_cloud_arrays(snapshot.get('semantic_cloud'))
 
         position = odom.pose.pose.position
         orientation = odom.pose.pose.orientation
@@ -626,6 +868,27 @@ class NavigationLearningRecorder(Node):
         nav2_command = snapshot.get('nav2_command') or Twist()
         output_command = snapshot.get('output_command') or Twist()
         twist = odom.twist.twist
+        imu_acceleration = np.full(3, np.nan, dtype=np.float32)
+        imu_angular_velocity = np.full(3, np.nan, dtype=np.float32)
+        imu_orientation = np.full(4, np.nan, dtype=np.float32)
+        imu = snapshot.get('imu')
+        if imu is not None and context['imu_age_s'] <= self.maximum_imu_age_s:
+            imu_acceleration[:] = [
+                imu.linear_acceleration.x,
+                imu.linear_acceleration.y,
+                imu.linear_acceleration.z,
+            ]
+            imu_angular_velocity[:] = [
+                imu.angular_velocity.x,
+                imu.angular_velocity.y,
+                imu.angular_velocity.z,
+            ]
+            imu_orientation[:] = [
+                imu.orientation.x,
+                imu.orientation.y,
+                imu.orientation.z,
+                imu.orientation.w,
+            ]
         sample_name = 'sample_%06d.npz' % context['sample_id']
         sample_path = context['session'] / 'samples' / sample_name
         arrays = {
@@ -636,6 +899,13 @@ class NavigationLearningRecorder(Node):
             'lidar_points_xyz': (
                 points if self.save_raw_points
                 else np.empty((0, 3), dtype=np.float32)
+            ),
+            'semantic_lidar_points_xyz': semantic_xyz,
+            'semantic_lidar_cos_incidence': semantic_cosine,
+            'semantic_lidar_object_idx': semantic_indices,
+            'semantic_lidar_object_tag': semantic_tags,
+            'semantic_alignment_delta_s': np.asarray(
+                context['semantic_alignment_delta_s'], dtype=np.float32
             ),
             'local_costmap_bev': local_costmap,
             'global_costmap_bev': global_costmap,
@@ -648,6 +918,9 @@ class NavigationLearningRecorder(Node):
                 twist.linear.x, twist.linear.y, twist.linear.z,
                 twist.angular.x, twist.angular.y, twist.angular.z,
             ], dtype=np.float32),
+            'imu_linear_acceleration_xyz': imu_acceleration,
+            'imu_angular_velocity_xyz': imu_angular_velocity,
+            'imu_orientation_xyzw': imu_orientation,
             'cmd_vel_nav2': np.asarray([
                 nav2_command.linear.x, nav2_command.angular.z
             ], dtype=np.float32),
@@ -671,6 +944,18 @@ class NavigationLearningRecorder(Node):
             'ros_time_s': '%.9f' % context['ros_time_s'],
             'cloud_stamp_s': '%.9f' % _stamp_seconds(cloud.header.stamp),
             'cloud_age_s': '%.4f' % context['cloud_age_s'],
+            'semantic_cloud_stamp_s': (
+                '%.9f' % context['semantic_cloud_stamp_s']
+                if math.isfinite(context['semantic_cloud_stamp_s']) else ''
+            ),
+            'semantic_alignment_delta_s': (
+                '%.5f' % context['semantic_alignment_delta_s']
+                if math.isfinite(context['semantic_alignment_delta_s']) else ''
+            ),
+            'imu_age_s': (
+                '%.4f' % context['imu_age_s']
+                if math.isfinite(context['imu_age_s']) else ''
+            ),
             'odom_age_s': '%.4f' % context['odom_age_s'],
             'file': ('samples/' + sample_name) if self.save_sample_files else '',
             'route_status': context['route_status'],

@@ -1,0 +1,101 @@
+gnss_odometry_shadow_node:
+  ros__parameters:
+    use_sim_time: true
+    gnss_topic: /gnss/fix
+    imu_topic: /vectornav/imu
+    output_topic: /localization/odometry_gps_shadow
+    status_topic: /localization/gnss_shadow_status
+    frame_id: odom_sensor_shadow
+    child_frame_id: base_link
+    # Overridden to carla_mercator only by an explicit simulation launch arg.
+    projection_mode: wgs84
+    origin_initialization_sample_count: 20
+    maximum_imu_age_s: 0.25
+    # Current CARLA real_vehicle profile. Replace with the measured real-car
+    # base_link -> AKN940 antenna offset before outdoor operation.
+    antenna_forward_m: 1.0
+    antenna_left_m: 0.0
+    default_horizontal_covariance_m2: 2.25
+    default_vertical_covariance_m2: 9.0
+    zero_altitude: true
+
+ekf_sensor_global_shadow:
+  ros__parameters:
+    use_sim_time: true
+    frequency: 30.0
+    sensor_timeout: 0.25
+    two_d_mode: true
+    transform_time_offset: 0.0
+    transform_timeout: 0.1
+    print_diagnostics: true
+    reset_on_time_jump: true
+    smooth_lagged_data: true
+    history_length: 1.0
+    publish_tf: false
+    publish_acceleration: false
+
+    map_frame: map_sensor_shadow
+    odom_frame: odom_sensor_shadow
+    base_link_frame: base_link
+    world_frame: odom_sensor_shadow
+
+    # AKN940/AKA900 supplies absolute horizontal position. The prior
+    # acceleration-only local EKF is intentionally excluded: with no wheel
+    # encoder its unobservable velocity reached about 100 m/s while parked.
+    # Consecutive GNSS corrections make horizontal velocity observable in
+    # this filter; measured wheel velocity can be added as odom1 later.
+    odom0: /localization/odometry_gps_shadow
+    odom0_config: [true,  true,  false,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom0_queue_size: 10
+    odom0_nodelay: true
+    odom0_differential: false
+    odom0_relative: false
+
+    # Heading and yaw rate come directly from the simulated VN-200. Linear
+    # acceleration is deliberately not integrated without wheel velocity.
+    imu0: /vectornav/imu
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_queue_size: 20
+    imu0_nodelay: true
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true
+
+    use_control: false
+
+localization_shadow_evaluator_node:
+  ros__parameters:
+    use_sim_time: true
+    ground_truth_topic: /vehicle/odometry
+    estimate_topic: /localization/odometry_shadow
+    gnss_odometry_topic: /localization/odometry_gps_shadow
+    status_topic: /localization/shadow_status
+    maximum_pair_delay_s: 0.15
+    history_size: 100000
+    pose_jump_threshold_m: 0.30
+
+    # These gates report whether a repeat shadow run has enough quality for a
+    # later active-control trial. They never switch control by themselves.
+    transition_minimum_moving_sample_count: 1000
+    transition_minimum_reference_speed_mps: 0.20
+    transition_maximum_estimate_age_s: 0.15
+    transition_maximum_gnss_age_s: 0.25
+    transition_maximum_position_p95_m: 0.30
+    transition_maximum_longitudinal_p95_m: 0.25
+    transition_maximum_lateral_p95_m: 0.20
+    transition_maximum_absolute_longitudinal_bias_m: 0.10
+    transition_maximum_relative_translation_p95_m: 0.08
+    transition_maximum_pose_jump_count: 0
+
+    # Keep these false until one authoritative sensor-owned odom -> base_link
+    # TF and an independent longitudinal velocity source have been verified.
+    active_navigation_tf_ready: false
+    independent_velocity_ready: false

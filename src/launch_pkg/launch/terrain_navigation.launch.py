@@ -34,6 +34,14 @@ def generate_launch_description():
             default_value='0.0',
         ),
         DeclareLaunchArgument(
+            'gnss_projection_mode',
+            default_value='wgs84',
+            description=(
+                'GNSS projection: wgs84 for real hardware; explicitly use '
+                'carla_mercator only with the CARLA GNSS actor'
+            ),
+        ),
+        DeclareLaunchArgument(
             'start_terrain_mapping',
             default_value='false',
         ),
@@ -90,6 +98,9 @@ def generate_launch_description():
                     'goal_altitude': ParameterValue(
                         LaunchConfiguration('goal_altitude'),
                         value_type=float,
+                    ),
+                    'projection_mode': LaunchConfiguration(
+                        'gnss_projection_mode'
                     ),
                 },
             ],

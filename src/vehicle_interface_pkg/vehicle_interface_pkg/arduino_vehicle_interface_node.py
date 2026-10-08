@@ -33,6 +33,9 @@ class ArduinoVehicleInterfaceNode(Node):
         self.declare_parameter('wheelbase_m', 1.0)
         self.declare_parameter('maximum_steering_angle_deg', 30.0)
         self.declare_parameter('maximum_steering_step', 7)
+        self.declare_parameter('steering_left_command', -7)
+        self.declare_parameter('steering_center_command', 0)
+        self.declare_parameter('steering_right_command', 7)
         self.declare_parameter('maximum_speed_mps', 1.0)
         self.declare_parameter('maximum_pwm', 100)
         self.declare_parameter('steering_direction', 1.0)
@@ -51,6 +54,15 @@ class ArduinoVehicleInterfaceNode(Node):
         ))
         self.maximum_steering_step = int(
             self.get_parameter('maximum_steering_step').value
+        )
+        self.steering_left_command = int(
+            self.get_parameter('steering_left_command').value
+        )
+        self.steering_center_command = int(
+            self.get_parameter('steering_center_command').value
+        )
+        self.steering_right_command = int(
+            self.get_parameter('steering_right_command').value
         )
         self.maximum_speed_mps = float(
             self.get_parameter('maximum_speed_mps').value
@@ -77,6 +89,9 @@ class ArduinoVehicleInterfaceNode(Node):
             maximum_pwm=self.maximum_pwm,
             steering_direction=self.steering_direction,
             motor_direction=self.motor_direction,
+            steering_left_command=self.steering_left_command,
+            steering_center_command=self.steering_center_command,
+            steering_right_command=self.steering_right_command,
         )
 
         self.serial_connection = None
@@ -118,10 +133,14 @@ class ArduinoVehicleInterfaceNode(Node):
 
         self.get_logger().info(
             'Vehicle interface ready: {} -> Arduino, wheelbase={:.3f} m, '
-            'steering=+/-{} steps, speed=+/-{:.3f} m/s -> PWM +/-{}'.format(
+            'steering commands left/centre/right={}/{}/{}, physical '
+            'limit=+/-{:.1f} deg, speed=+/-{:.3f} m/s -> PWM +/-{}'.format(
                 input_topic,
                 self.wheelbase_m,
-                self.maximum_steering_step,
+                self.steering_left_command,
+                self.steering_center_command,
+                self.steering_right_command,
+                math.degrees(self.maximum_steering_angle_rad),
                 self.maximum_speed_mps,
                 self.maximum_pwm,
             )
@@ -138,6 +157,9 @@ class ArduinoVehicleInterfaceNode(Node):
             maximum_pwm=self.maximum_pwm,
             steering_direction=self.steering_direction,
             motor_direction=self.motor_direction,
+            steering_left_command=self.steering_left_command,
+            steering_center_command=self.steering_center_command,
+            steering_right_command=self.steering_right_command,
         )
 
     def _send(self, command, *, publish_debug=True):
@@ -188,6 +210,9 @@ class ArduinoVehicleInterfaceNode(Node):
             maximum_pwm=self.maximum_pwm,
             steering_direction=self.steering_direction,
             motor_direction=self.motor_direction,
+            steering_left_command=self.steering_left_command,
+            steering_center_command=self.steering_center_command,
+            steering_right_command=self.steering_right_command,
         )
         self._send(command, publish_debug=False)
 

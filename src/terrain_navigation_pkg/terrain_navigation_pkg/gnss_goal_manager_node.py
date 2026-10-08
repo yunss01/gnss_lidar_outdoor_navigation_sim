@@ -33,6 +33,21 @@ def _quaternion_z_w(yaw_rad: float):
     return math.sin(0.5 * yaw_rad), math.cos(0.5 * yaw_rad)
 
 
+def _stamp_ns(stamp):
+    return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def anchor_fix_is_new_enough(
+        latest_gnss_stamp_ns, minimum_anchor_gnss_stamp_ns):
+    """Return whether a GNSS fix is safe for the pending odometry anchor."""
+    if latest_gnss_stamp_ns is None:
+        return False
+    return (
+        minimum_anchor_gnss_stamp_ns is None
+        or latest_gnss_stamp_ns >= minimum_anchor_gnss_stamp_ns
+    )
+
+
 NAVIGATION_LOG_FIELDS = [
     'sequence',
     'wall_time_iso',
@@ -113,10 +128,11 @@ class GnssGoalManagerNode(Node):
     def __init__(self):
         super().__init__('gnss_goal_manager_node')
 
-        self.declare_parameter('gnss_topic', '/vectornav/gnss')
+        self.declare_parameter('gnss_topic', '/gnss/fix')
         self.declare_parameter('odometry_topic', '/vehicle/odometry')
         self.declare_parameter('goal_topic', '/navigation/goal_gnss')
         self.declare_parameter('frame_id', 'map')
+        self.declare_parameter('projection_mode', 'wgs84')
         self.declare_parameter('goal_enabled', False)
         self.declare_parameter('goal_latitude', 0.0)
         self.declare_parameter('goal_longitude', 0.0)
@@ -138,6 +154,15 @@ class GnssGoalManagerNode(Node):
         )
 
         self.frame_id = str(self.get_parameter('frame_id').value)
+        self.projection_mode = str(
+            self.get_parameter('projection_mode').value
+        )
+        # Validate the configured mode before accepting any live GNSS data.
+        geodetic_to_enu(
+            GeodeticPoint(0.0, 0.0, 0.0),
+            GeodeticPoint(0.0, 0.0, 0.0),
+            self.projection_mode,
+        )
         self.use_odometry = bool(
             self.get_parameter('use_odometry_position').value
         )
@@ -273,12 +298,14 @@ class GnssGoalManagerNode(Node):
         self.current_local: Optional[EnuPoint] = None
         self.latest_gnss_message: Optional[NavSatFix] = None
         self.latest_gnss_wall_time: Optional[float] = None
+        self.latest_gnss_stamp_ns = None
         self.latest_odometry_xy = None
         self.latest_odometry_stamp = None
         self.previous_odometry_xy = None
         self.odometry_anchor_xy = None
         self.odometry_anchor_local: Optional[EnuPoint] = None
         self.pending_odometry_anchor_local: Optional[EnuPoint] = None
+        self.minimum_anchor_gnss_stamp_ns = None
         self.latest_odometry_wall_time: Optional[float] = None
         self.position_source = 'none'
         self.last_status = None
@@ -310,11 +337,12 @@ class GnssGoalManagerNode(Node):
         )
         self.get_logger().info(
             'GNSS goal manager ready; goal topic={} frame={} '
-            'odometry_position={} origin_samples={}'.format(
+            'odometry_position={} origin_samples={} projection={}'.format(
                 self.get_parameter('goal_topic').value,
                 self.frame_id,
                 self.use_odometry,
                 self.origin_sample_count,
+                self.projection_mode,
             )
         )
 
@@ -323,7 +351,9 @@ class GnssGoalManagerNode(Node):
         self.goal = goal
         self.arrival.reset()
         self.goal_local = (
-            geodetic_to_enu(goal, self.origin)
+            geodetic_to_enu(
+                goal, self.origin, self.projection_mode
+            )
             if self.origin is not None else None
         )
         if hasattr(self, 'navigation_logger'):
@@ -387,6 +417,7 @@ class GnssGoalManagerNode(Node):
         self.latest_gnss_point = current_fix
         self.latest_gnss_message = message
         self.latest_gnss_wall_time = time.monotonic()
+        self.latest_gnss_stamp_ns = _stamp_ns(message.header.stamp)
         if self.origin is None:
             self.origin_samples.append(current_fix)
             self.origin_source_message = message
@@ -402,7 +433,7 @@ class GnssGoalManagerNode(Node):
             self._finalize_origin()
 
         self.latest_gnss_local = geodetic_to_enu(
-            current_fix, self.origin
+            current_fix, self.origin, self.projection_mode
         )
         if not self.use_odometry:
             self._update_position(self.latest_gnss_local, 'gnss')
@@ -418,10 +449,14 @@ class GnssGoalManagerNode(Node):
         source = self.origin_source_message
         self._publish_origin(source)
         if self.goal is not None:
-            self.goal_local = geodetic_to_enu(self.goal, self.origin)
+            self.goal_local = geodetic_to_enu(
+                self.goal, self.origin, self.projection_mode
+            )
 
         offsets = [
-            geodetic_to_enu(point, self.origin)
+            geodetic_to_enu(
+                point, self.origin, self.projection_mode
+            )
             for point in self.origin_samples
         ]
         radial_offsets = [
@@ -456,6 +491,10 @@ class GnssGoalManagerNode(Node):
         if (
             self.latest_odometry_xy is None
             or self.latest_gnss_local is None
+            or not anchor_fix_is_new_enough(
+                self.latest_gnss_stamp_ns,
+                self.minimum_anchor_gnss_stamp_ns,
+            )
         ):
             return
         anchor_local = (
@@ -466,6 +505,7 @@ class GnssGoalManagerNode(Node):
         self.odometry_anchor_xy = self.latest_odometry_xy
         self.odometry_anchor_local = anchor_local
         self.pending_odometry_anchor_local = None
+        self.minimum_anchor_gnss_stamp_ns = None
         self.previous_odometry_xy = self.latest_odometry_xy
         self._update_position(anchor_local, 'odometry')
         self.get_logger().info(
@@ -503,13 +543,18 @@ class GnssGoalManagerNode(Node):
             )
             if step > self.maximum_odometry_step_m:
                 self.get_logger().warning(
-                    'Odometry jumped {:.2f} m; re-anchoring from GNSS'.format(
+                    'Odometry jumped {:.2f} m; waiting for a post-jump '
+                    'GNSS fix before re-anchoring'.format(
                         step
                     )
                 )
                 self.odometry_anchor_xy = None
                 self.odometry_anchor_local = None
-                self._anchor_odometry()
+                self.current_local = None
+                self.position_source = 'waiting_for_post_jump_gnss'
+                self.previous_odometry_xy = current_xy
+                self.minimum_anchor_gnss_stamp_ns = _stamp_ns(
+                    message.header.stamp)
                 return
         self.previous_odometry_xy = current_xy
         local = EnuPoint(
@@ -565,6 +610,7 @@ class GnssGoalManagerNode(Node):
         self.navigation_logger.write_metadata({
             'created_at': datetime.now().astimezone().isoformat(),
             'frame_id': self.frame_id,
+            'projection_mode': self.projection_mode,
             'gnss_topic': str(self.get_parameter('gnss_topic').value),
             'odometry_topic': str(
                 self.get_parameter('odometry_topic').value

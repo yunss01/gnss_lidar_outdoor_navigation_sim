@@ -163,6 +163,144 @@ class PathEfficiencyAssessment:
     reasons: Tuple[str, ...]
 
 
+@dataclass
+class SafetyRejectionMonitor:
+    """Debounce independent LiDAR rejections of one active Nav2 segment.
+
+    One rejected scan can be a transient return.  Counting only distinct
+    cloud identifiers inside a bounded wall-time window prevents duplicate
+    publications from triggering a replan while still reacting much sooner
+    than Nav2's progress-checker timeout.
+    """
+
+    required_confirmations: int
+    window_s: float
+    count: int = 0
+    window_started_s: float | None = None
+    last_evidence_id: int | None = None
+
+    def __post_init__(self):
+        self.required_confirmations = int(self.required_confirmations)
+        self.window_s = float(self.window_s)
+        if self.required_confirmations < 1:
+            raise ValueError('safety rejection confirmations must be positive')
+        if not math.isfinite(self.window_s) or self.window_s <= 0.0:
+            raise ValueError('safety rejection window must be positive')
+
+    def reset(self):
+        self.count = 0
+        self.window_started_s = None
+        self.last_evidence_id = None
+
+    def observe(self, now_s: float, evidence_id: int):
+        """Return true once enough distinct evidence arrives in the window."""
+
+        now = float(now_s)
+        identifier = int(evidence_id)
+        if not math.isfinite(now):
+            raise ValueError('safety rejection time must be finite')
+        if identifier == 0:
+            raise ValueError('safety rejection evidence id cannot be zero')
+        if identifier == self.last_evidence_id:
+            return False
+        if (
+            self.window_started_s is None
+            or now < self.window_started_s
+            or now - self.window_started_s > self.window_s
+        ):
+            self.count = 0
+            self.window_started_s = now
+        self.last_evidence_id = identifier
+        self.count += 1
+        return self.count >= self.required_confirmations
+
+
+def is_actionable_safety_stop(
+    state: str,
+    state_age_s: float,
+    timeout_s: float,
+):
+    """Return whether a safety state authorizes discarding the active path."""
+
+    age = float(state_age_s)
+    timeout = float(timeout_s)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError('safety state timeout must be positive')
+    return (
+        str(state) == 'obstacle_stop'
+        and math.isfinite(age)
+        and 0.0 <= age <= timeout
+    )
+
+
+@dataclass
+class SafetyReplanHold:
+    """Bound replanning until the raw-LiDAR safety state settles.
+
+    A safety-triggered Nav2 cancellation must not immediately replace the
+    stopped segment while the same obstacle scan is still active.  Consecutive
+    clear states release the hold early; the finite timeout prevents a missing
+    state message from deadlocking navigation.  This class never changes the
+    safety command itself.
+    """
+
+    required_clear_confirmations: int
+    maximum_hold_s: float
+    active: bool = False
+    started_s: float | None = None
+    clear_count: int = 0
+
+    def __post_init__(self):
+        self.required_clear_confirmations = int(
+            self.required_clear_confirmations
+        )
+        self.maximum_hold_s = float(self.maximum_hold_s)
+        if self.required_clear_confirmations < 1:
+            raise ValueError(
+                'safety replan clear confirmations must be positive'
+            )
+        if (
+            not math.isfinite(self.maximum_hold_s)
+            or self.maximum_hold_s <= 0.0
+        ):
+            raise ValueError('safety replan maximum hold must be positive')
+
+    def arm(self, now_s: float):
+        now = float(now_s)
+        if not math.isfinite(now):
+            raise ValueError('safety replan hold time must be finite')
+        self.active = True
+        self.started_s = now
+        self.clear_count = 0
+
+    def reset(self):
+        self.active = False
+        self.started_s = None
+        self.clear_count = 0
+
+    def observe_state(self, state: str):
+        if not self.active:
+            return
+        if str(state) == 'clear':
+            self.clear_count += 1
+        else:
+            self.clear_count = 0
+
+    def release_reason(self, now_s: float):
+        """Return the release reason, or ``None`` while still holding."""
+
+        if not self.active:
+            return 'inactive'
+        now = float(now_s)
+        if not math.isfinite(now):
+            raise ValueError('safety replan hold time must be finite')
+        if self.clear_count >= self.required_clear_confirmations:
+            return 'clear_confirmed'
+        if self.started_s is None or now - self.started_s >= self.maximum_hold_s:
+            return 'timeout'
+        return None
+
+
 def can_accept_length_only_detour(
     assessment: PathEfficiencyAssessment,
     previous_rejections: int,
@@ -738,15 +876,18 @@ def assess_active_replan(
 ):
     """Decide whether a fresh guide is materially better than the active one.
 
-    A persistent hard-invalid Smac path is always eligible for replacement.
-    Replacing a still-valid path merely because a shorter guide appeared is
-    optional: online rolling costmaps can alternately reveal left and right
-    corridors and otherwise cause action-cancel/steering chatter.  When that
-    experimental optimization is enabled, both guides must end at the same
-    rolling-map target, the new subgoal must select a different corridor, and
-    the remaining route must be shorter by a configured margin.  Temporal
-    confirmation is deliberately handled by the ROS node so this helper stays
-    deterministic.
+    A persistent hard-invalid Smac path is eligible for external replacement
+    only when the fresh guide selects a materially different subgoal.  Nav2's
+    behavior tree already replans an invalid path and keeps the current path
+    when a replacement cannot be computed, so cancelling an action for guide
+    jitter merely creates command gaps.  Replacing a still-valid path merely
+    because a shorter guide appeared is optional: online rolling costmaps can
+    alternately reveal left and right corridors and otherwise cause
+    action-cancel/steering chatter.  When that experimental optimization is
+    enabled, both guides must end at the same rolling-map target, the new
+    subgoal must select a different corridor, and the remaining route must be
+    shorter by a configured margin.  Temporal confirmation is deliberately
+    handled by the ROS node so this helper stays deterministic.
     """
     if not active_path or not candidate_path:
         return None
@@ -758,6 +899,8 @@ def assess_active_replan(
     candidate_length = polyline_length(candidate_path)
     improvement = active_remaining - candidate_length
     if path_blocked:
+        if subgoal_change < minimum_subgoal_change_m:
+            return None
         return ActiveReplanAssessment(
             'path_blocked', subgoal_change, active_remaining,
             candidate_length, improvement,

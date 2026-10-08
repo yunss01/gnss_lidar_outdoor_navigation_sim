@@ -1,14 +1,58 @@
 <!--
-  Forward-only Ackermann navigation tree. It replans at 1 Hz but deliberately
-  omits Spin recovery because a car cannot rotate in place. A planning or
-  control failure therefore produces a stop for diagnosis instead of an
-  unrealistic manoeuvre.
+  Forward-only Ackermann navigation tree. At 1 Hz it validates the active path,
+  but it replans only when the goal changed or that path became invalid. A new
+  waypoint must receive a valid initial plan. Later replans write into a
+  candidate path and replace the active path only after planning succeeds, so
+  a transient planner failure cannot erase a path that the controller is
+  already following. Failed replacement plans are retried on the next 1 Hz
+  tick while the independent path-validity and raw-LiDAR gates retain stop
+  authority. Spin is deliberately omitted because a car cannot rotate in
+  place.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <PipelineSequence name="NavigateWithAckermannReplanning">
       <RateController hz="1.0">
-        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        <Fallback name="KeepOrReplaceAckermannPath">
+          <SequenceStar name="PlanUpdatedGoal">
+            <GlobalUpdatedGoal/>
+            <SetBlackboard value="true" output_key="goal_plan_required"/>
+            <RecoveryNode number_of_retries="2"
+              name="ComputeRequiredAckermannPath">
+              <SequenceStar name="CommitRequiredAckermannPath">
+                <ComputePathToPose goal="{goal}"
+                  path="{candidate_path}" planner_id="GridBased"/>
+                <SetBlackboard value="{candidate_path}"
+                  output_key="path"/>
+              </SequenceStar>
+              <ClearEntireCostmap name="ClearRequiredGlobalCostmap"
+                service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+            <SetBlackboard value="false" output_key="goal_plan_required"/>
+          </SequenceStar>
+
+          <BlackboardCheckString value_A="{goal_plan_required}"
+            value_B="false" return_on_mismatch="FAILURE">
+            <IsPathValid path="{path}"/>
+          </BlackboardCheckString>
+
+          <BlackboardCheckString value_A="{goal_plan_required}"
+            value_B="false" return_on_mismatch="FAILURE">
+            <ForceSuccess name="KeepActivePathIfReplacementFails">
+              <RecoveryNode number_of_retries="2"
+                name="TryReplacementAckermannPath">
+                <SequenceStar name="CommitReplacementAckermannPath">
+                  <ComputePathToPose goal="{goal}"
+                    path="{candidate_path}" planner_id="GridBased"/>
+                  <SetBlackboard value="{candidate_path}"
+                    output_key="path"/>
+                </SequenceStar>
+                <ClearEntireCostmap name="ClearReplacementGlobalCostmap"
+                  service_name="global_costmap/clear_entirely_global_costmap"/>
+              </RecoveryNode>
+            </ForceSuccess>
+          </BlackboardCheckString>
+        </Fallback>
       </RateController>
       <FollowPath path="{path}" controller_id="FollowPath"/>
     </PipelineSequence>

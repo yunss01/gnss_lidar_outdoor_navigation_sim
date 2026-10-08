@@ -31,6 +31,7 @@ from .nav2_goal_bridge_core import rolling_waypoint_capture_radius
 from .nav2_goal_bridge_core import rolling_waypoint_turn_angle_deg
 from .nav2_goal_bridge_core import should_focus_rolling_waypoint
 from .nav2_goal_bridge_core import should_promote_near_goal_route_abort
+from .nav2_goal_bridge_core import should_retry_aborted_rolling_segment
 from .nav2_goal_bridge_core import should_retry_rolling_preview_as_current_only
 from .navigation_core import GeodeticPoint, geodetic_to_enu
 from .waypoint_route_core import parse_waypoint_route_json
@@ -65,6 +66,7 @@ class Nav2GoalBridgeNode(Node):
         self.declare_parameter('safety_state_topic', '/safety/state')
         self.declare_parameter('route_abort_success_radius_m', 1.5)
         self.declare_parameter('goal_rejection_retry_s', 1.0)
+        self.declare_parameter('rolling_segment_abort_retry_s', 1.0)
         self.declare_parameter('rolling_horizon_window_size', 2)
         self.declare_parameter('rolling_horizon_max_distance_m', 45.0)
         self.declare_parameter('rolling_waypoint_capture_radius_m', 1.0)
@@ -99,6 +101,9 @@ class Nav2GoalBridgeNode(Node):
         )
         self.goal_rejection_retry_s = float(
             self.get_parameter('goal_rejection_retry_s').value
+        )
+        self.rolling_segment_abort_retry_s = float(
+            self.get_parameter('rolling_segment_abort_retry_s').value
         )
         self.rolling_horizon_window_size = int(
             self.get_parameter('rolling_horizon_window_size').value
@@ -154,6 +159,10 @@ class Nav2GoalBridgeNode(Node):
             raise ValueError('route_abort_success_radius_m must be positive')
         if self.goal_rejection_retry_s <= 0.0:
             raise ValueError('goal_rejection_retry_s must be positive')
+        if self.rolling_segment_abort_retry_s <= 0.0:
+            raise ValueError(
+                'rolling_segment_abort_retry_s must be positive'
+            )
         if self.rolling_horizon_window_size < 2:
             raise ValueError(
                 'rolling_horizon_window_size must be at least 2'
@@ -1639,6 +1648,39 @@ class Nav2GoalBridgeNode(Node):
                 self._publish_status(
                     'rolling_preview_abort_current_only_retry'
                 )
+        retry_aborted_segment = should_retry_aborted_rolling_segment(
+            status,
+            is_current,
+            goal_mode,
+            route_window_start,
+            self.rolling_route_poses is not None,
+            (
+                self.pending_route_poses is not None
+                or self.pending_pose is not None
+            ),
+        )
+        if retry_aborted_segment and self._queue_rolling_segment(
+            retry_waypoint_index
+        ):
+            self.next_goal_send_wall_time = (
+                time.monotonic() + self.rolling_segment_abort_retry_s
+            )
+            self._log_event(
+                'rolling_segment_abort_retry_queued',
+                self.rolling_route_enu[retry_waypoint_index],
+                status,
+                goal_mode='rolling_segment',
+                route_pose_count=1,
+            )
+            self.get_logger().warning(
+                'Rolling segment at waypoint {} aborted; vehicle remains '
+                'stopped and the same mission segment will be replanned '
+                'after {:.1f} s'.format(
+                    retry_waypoint_index + 1,
+                    self.rolling_segment_abort_retry_s,
+                )
+            )
+            self._publish_status('rolling_segment_abort_retry_wait')
         if (
             is_current
             and goal_mode == 'rolling_segment'
@@ -1671,7 +1713,11 @@ class Nav2GoalBridgeNode(Node):
             # A canceled goal must not overwrite the status of the goal that
             # is about to replace it.  This was the source of intermittent
             # waypoint handoff stops.
-            self._publish_status('handoff_to_next_goal')
+            self._publish_status(
+                'rolling_segment_abort_retry_wait'
+                if retry_aborted_segment
+                else 'handoff_to_next_goal'
+            )
             self._try_send_pending()
             return
         if (

@@ -7,10 +7,19 @@ arduino_vehicle_interface_node:
     baud_rate: 115200
     serial_timeout_s: 0.1
     dry_run: false
-    # Initial values only. Measure the actual terrain vehicle before driving.
-    wheelbase_m: 1.0
-    maximum_steering_angle_deg: 30.0
+    # Measured 1/5-scale terrain vehicle geometry.  The steering angle remains
+    # an initial visual estimate and must be replaced after a turning-circle
+    # or wheel-angle calibration.
+    wheelbase_m: 0.80
+    maximum_steering_angle_deg: 20.0
+    # Serial steering calibration for dynamic_obstacle_ws driving.ino.
+    # Positive ROS yaw is physical left, while that firmware represents full
+    # left/centre/right as -7/0/+7.  These three values may be changed later
+    # without changing or rebuilding the ROS node.
     maximum_steering_step: 7
+    steering_left_command: -7
+    steering_center_command: 0
+    steering_right_command: 7
     # Current navigation limit is about 4 km/h. PWM 100 follows the existing
     # educational vehicle code but needs a real no-load/loaded speed test.
     maximum_speed_mps: 1.0
@@ -40,10 +49,16 @@ lidar_processor_node:
     rotation_offset: 0
 gnss_goal_manager_node:
   ros__parameters:
-    gnss_topic: /vectornav/gnss
+    # AKN-940-LTE receiver using the AKA900 antenna.  VN-200 contributes IMU
+    # data only; keeping GNSS outside the /vectornav namespace prevents an
+    # accidental switch back to its internal GNSS/INS output.
+    gnss_topic: /gnss/fix
     odometry_topic: /vehicle/odometry
     goal_topic: /navigation/goal_gnss
     frame_id: map
+    # Production-safe default. CARLA launches must explicitly request
+    # carla_mercator so simulator geodesy cannot leak into the real vehicle.
+    projection_mode: wgs84
     goal_enabled: false
     goal_latitude: 0.0
     goal_longitude: 0.0
@@ -98,6 +113,18 @@ navigation_learning_recorder_node:
     # only when collecting BEV tensors for future imitation learning.
     save_sample_files: false
     save_raw_points: false
+    # Training-only CARLA supervision. The deployed model never subscribes to
+    # this topic. Enable through collect_traversability_data:=true.
+    save_semantic_labels: false
+    maximum_semantic_alignment_s: 0.03
+    # Optional vehicle-policy label for one controlled CARLA actor.  Keep the
+    # ID at -1 for ordinary recording.  A non-negative ID requires semantic
+    # collection and disposition=obstacle|passable|ambiguous.
+    controlled_traversability_actor_id: -1
+    controlled_traversability_disposition: ''
+    controlled_traversability_blueprint: ''
+    controlled_traversability_policy_source: vehicle_clearance_policy
+    maximum_imu_age_s: 0.2
     # A separate, stationary raw-LiDAR capture for perception validation.
     # The launch argument `perception_capture:=true` overrides the two save
     # flags above, waits for fresh sensors, records for the chosen duration,
@@ -115,6 +142,8 @@ navigation_learning_recorder_node:
     bev_z_max_m: 3.0
     bev_resolution_m: 0.25
     point_cloud_topic: /lidar/points
+    semantic_cloud_topic: /lidar/semantic_points
+    imu_topic: /vectornav/imu
     odometry_topic: /vehicle/odometry
     route_topic: /navigation/waypoint_route
     route_status_topic: /navigation/route_status
@@ -148,6 +177,10 @@ nav2_goal_bridge_node:
     odom_frame: odom
     goal_change_tolerance_m: 0.25
     input_timeout_s: 1.0
+    # A failed required Hybrid replan stops the controller, but it must not
+    # erase the F9/F10 mission. Reissue the same rolling segment after a short
+    # stationary backoff; a canceled waypoint handoff is never retried here.
+    rolling_segment_abort_retry_s: 1.0
     # F9 open routes and F10 closed laps plan only the current and next
     # waypoint so the mapless local costmap need not cover the full route.
     rolling_horizon_window_size: 2
@@ -303,6 +336,21 @@ far_nav2_guide_node:
     stuck_costmap_recovery_cooldown_s: 10.0
     safety_state_topic: /safety/state
     safety_state_timeout_s: 1.5
+    # Raw-LiDAR safety already stops an unsafe commanded arc immediately.
+    # Feed three distinct rejected scans back to FAR so it replaces that
+    # guide instead of waiting 15 s for Nav2's progress checker. This never
+    # clears an obstacle or overrides the emergency-stop command.
+    safety_trajectory_rejection_topic: /safety/trajectory_rejection
+    safety_rejection_replanning_enabled: true
+    safety_rejection_confirmations: 3
+    safety_rejection_window_s: 1.0
+    safety_rejection_minimum_goal_age_s: 0.5
+    # Only a fresh obstacle_stop can trigger cancellation. After cancellation,
+    # wait for three consecutive clear states, but never longer than one
+    # second, before asking Nav2 for a replacement segment. The independent
+    # raw-LiDAR safety command remains authoritative throughout this hold.
+    safety_replan_clear_confirmations: 3
+    safety_replan_maximum_hold_s: 1.0
     local_costmap_clear_service: /local_costmap/clear_around_local_costmap
     global_costmap_clear_service: /global_costmap/clear_around_global_costmap
     # The Nav2 map is 0.25 m/cell. A stride of 2 gives a 0.5 m guide grid,
@@ -329,7 +377,10 @@ far_nav2_guide_node:
 lidar_obstacle_filter_node:
   ros__parameters:
     input_topic: /lidar/points
-    output_topic: /lidar/nav2_obstacles
+    # The authority node relays this private baseline to the established
+    # /lidar/nav2_obstacles interface. It can add evidence-v2 endpoints but
+    # can never remove a baseline point.
+    output_topic: /lidar/nav2_obstacles_baseline
     point_count_topic: /lidar/nav2_obstacle_count
     # The sensor is on the roof. Ground lies below this band, while vehicle,
     # pole, container and wall returns remain in it.
@@ -371,6 +422,80 @@ lidar_obstacle_filter_node:
     # topic is clearing-only in both Nav2 costmaps and cannot mark obstacles.
     clearing_output_topic: /lidar/nav2_clearing
     clearing_voxel_size_m: 0.50
+traversability_evidence_shadow_node:
+  ros__parameters:
+    input_topic: /lidar/points
+    passable_probability_topic: /learning/evidence_v2/passable_probability
+    obstacle_probability_topic: /learning/evidence_v2/obstacle_probability
+    decision_topic: /learning/evidence_v2/decision
+    hard_obstacle_topic: /learning/evidence_v2/hard_obstacle
+    status_topic: /learning/evidence_v2/status
+    maximum_inference_rate_hz: 5.0
+    passable_probability_threshold: 0.90
+    obstacle_probability_threshold: 0.50
+    maximum_obstacle_probability_for_passable: 0.10
+    minimum_passable_support: 0.20
+    maximum_mc_variance: 0.02
+    # These are the frozen CARLA Lincoln values used to build the training BEV.
+    # Replace them with a separately measured 1/5-scale vehicle profile before
+    # active real-platform tests; do not scale them by an assumed ratio.
+    hard_obstacle_minimum_relative_height_m: 0.15
+    hard_obstacle_minimum_vertical_span_m: 0.15
+    hard_obstacle_minimum_absolute_height_m: -1.40
+    local_ground_near_radius_m: 0.75
+    local_ground_far_radius_m: 1.50
+    local_ground_quantile: 0.25
+    local_ground_minimum_support_cells: 4
+    bev_x_min_m: -10.0
+    bev_x_max_m: 30.0
+    bev_y_min_m: -20.0
+    bev_y_max_m: 20.0
+    bev_resolution_m: 0.25
+    bev_z_min_m: -2.0
+    bev_z_max_m: 3.0
+    ego_rear_m: 2.5
+    ego_front_m: 2.4
+    ego_half_width_m: 1.0
+traversability_obstacle_authority_node:
+  ros__parameters:
+    raw_cloud_topic: /lidar/points
+    baseline_cloud_topic: /lidar/nav2_obstacles_baseline
+    decision_topic: /learning/evidence_v2/decision
+    selected_cloud_topic: /lidar/nav2_obstacles
+    candidate_cloud_topic: /learning/evidence_v2/nav2_obstacles_candidate
+    added_cloud_topic: /learning/evidence_v2/added_obstacles
+    status_topic: /learning/evidence_v2/authority_status
+    cache_size: 32
+    maximum_ai_silence_s: 0.50
+    maximum_exact_match_delay_s: 0.50
+    minimum_range_m: 1.5
+    # Baseline obstacle sensing remains 45 m.  The learned model may append
+    # new endpoints only in the validated near field, where LiDAR support is
+    # dense enough for a reliable local-ground check.
+    maximum_range_m: 12.0
+    obstacle_maximum_z_m: 1.0
+    # In an obstacle cell append only returns near its maximum height. This
+    # prevents a road return sharing the cell with a small object from being
+    # inserted as a ground-level obstacle endpoint.
+    obstacle_cell_top_band_m: 0.05
+    # A learned obstacle endpoint must also be physically raised above a
+    # supported local road estimate.  Unsupported/surface-level cells retain
+    # the baseline unchanged instead of creating a phantom Nav2 obstacle.
+    addition_minimum_relative_height_m: 0.07
+    addition_local_ground_radius_m: 0.75
+    addition_local_ground_quantile: 0.25
+    addition_local_ground_minimum_support_cells: 4
+    voxel_size_m: 0.20
+    ego_front_m: 2.55
+    ego_rear_m: 2.65
+    ego_half_width_m: 1.15
+    bev_x_min_m: -10.0
+    bev_x_max_m: 30.0
+    bev_y_min_m: -20.0
+    bev_y_max_m: 20.0
+    bev_resolution_m: 0.25
+    bev_z_min_m: -2.0
+    bev_z_max_m: 3.0
 path_clearance_validator_node:
   ros__parameters:
     path_topic: /plan

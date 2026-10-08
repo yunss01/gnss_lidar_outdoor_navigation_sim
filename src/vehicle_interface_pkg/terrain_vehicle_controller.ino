@@ -1,25 +1,30 @@
 // Terrain navigation vehicle controller.
-// Pin assignment follows the 2026 H-Mobility training material.
+// Hardware wiring and line protocol follow:
+//   ~/dynamic_obstacle_ws/src/control/driving/driving.ino
+//
+// ROS sends: s<steering>l<left_pwm>r<right_pwm>\n
+// The steering endpoint commands are configured independently in params.yaml;
+// this firmware keeps the known working -7..+7 controller range.
 
 const unsigned int MAX_INPUT = 32;
 
 // 조향모터 드라이버
 const int STEERING_IN1 = 2;
 const int STEERING_IN2 = 3;
-const int STEERING_POT = A2;
+const int STEERING_POT = A0;
 
 // 우측 구동모터 드라이버
-const int RIGHT_REAR_IN1 = 4;
-const int RIGHT_REAR_IN2 = 5;
+const int RIGHT_REAR_IN1 = 8;
+const int RIGHT_REAR_IN2 = 9;
 
 // 좌측 구동모터 드라이버
-const int LEFT_REAR_IN1 = 6;
-const int LEFT_REAR_IN2 = 7;
+const int LEFT_REAR_IN1 = 7;
+const int LEFT_REAR_IN2 = 6;
 
 const int STEERING_PWM = 128;
 const int MAX_STEERING_STEP = 7;
 
-// 가변저항 좌우측 값
+// 가변저항 좌우측 값.  실제 차량에서 다시 읽은 뒤 이 두 값만 수정한다.
 const int POTENTIOMETER_MOST_LEFT = 550;
 const int POTENTIOMETER_MOST_RIGHT = 440;
 
@@ -114,4 +119,3 @@ void loop() {
     lastControlTime = now;
   }
 }
-

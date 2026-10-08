@@ -14,6 +14,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rclpy.qos import ReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, Float32, String, UInt32
@@ -468,7 +469,7 @@ class LidarEmergencyStopNode(Node):
             PointCloud2,
             str(self.get_parameter('input_cloud_topic').value),
             self._on_cloud,
-            1,
+            qos_profile_sensor_data,
         )
         self.create_subscription(
             Twist,

@@ -16,6 +16,7 @@ WGS84_ECCENTRICITY_SQUARED = (
     WGS84_FLATTENING * (2.0 - WGS84_FLATTENING)
 )
 MEAN_EARTH_RADIUS_M = 6371008.8
+GEODETIC_PROJECTION_MODES = ('wgs84', 'carla_mercator')
 
 
 @dataclass(frozen=True)
@@ -231,8 +232,55 @@ def geodetic_to_ecef(point: GeodeticPoint) -> Tuple[float, float, float]:
 def geodetic_to_enu(
     point: GeodeticPoint,
     origin: GeodeticPoint,
+    projection_mode: str = 'wgs84',
 ) -> EnuPoint:
-    """Convert a WGS84 point to an ENU tangent frame at ``origin``."""
+    """Convert a geodetic point to a local east/north/up frame.
+
+    ``wgs84`` is the production conversion for real receivers. CARLA's GNSS
+    actor uses its legacy Mercator georeference scale; near the equator this
+    differs from the WGS84 meridional scale by about 0.7 percent. The explicit
+    ``carla_mercator`` mode reproduces that simulator contract without
+    weakening or silently changing the real-vehicle default.
+    """
+    validate_geodetic(point)
+    validate_geodetic(origin)
+    if projection_mode not in GEODETIC_PROJECTION_MODES:
+        raise ValueError(
+            'projection_mode must be one of: {}'.format(
+                ', '.join(GEODETIC_PROJECTION_MODES)
+            )
+        )
+    if projection_mode == 'carla_mercator':
+        point_latitude = math.radians(point.latitude_deg)
+        origin_latitude = math.radians(origin.latitude_deg)
+        if (
+            abs(point_latitude) >= 0.5 * math.pi
+            or abs(origin_latitude) >= 0.5 * math.pi
+        ):
+            raise ValueError(
+                'carla_mercator is undefined at the geographic poles'
+            )
+
+        # This follows CARLA's legacy LatLonToMercator convention: scale the
+        # Web-Mercator plane by cos(reference latitude). It is deliberately a
+        # simulator-only projection, not an approximation used by hardware.
+        scale = math.cos(origin_latitude)
+        longitude_delta = math.radians(
+            point.longitude_deg - origin.longitude_deg
+        )
+
+        def mercator_y(latitude_rad):
+            return math.asinh(math.tan(latitude_rad))
+
+        return EnuPoint(
+            WGS84_SEMI_MAJOR_M * scale * longitude_delta,
+            WGS84_SEMI_MAJOR_M * scale * (
+                mercator_y(point_latitude)
+                - mercator_y(origin_latitude)
+            ),
+            point.altitude_m - origin.altitude_m,
+        )
+
     point_ecef = geodetic_to_ecef(point)
     origin_ecef = geodetic_to_ecef(origin)
     delta_x = point_ecef[0] - origin_ecef[0]

@@ -54,6 +54,11 @@ def generate_launch_description():
         'config',
         'nav2_outdoor_params.yaml',
     ])
+    localization_shadow_parameters = PathJoinSubstitution([
+        config_share,
+        'config',
+        'localization_shadow.yaml',
+    ])
     evaluation_parameters = PathJoinSubstitution([
         config_share,
         'config',
@@ -95,6 +100,14 @@ def generate_launch_description():
         DeclareLaunchArgument('goal_longitude', default_value='0.0'),
         DeclareLaunchArgument('goal_altitude', default_value='0.0'),
         DeclareLaunchArgument(
+            'gnss_projection_mode',
+            default_value='wgs84',
+            description=(
+                'GNSS projection: wgs84 for real hardware; explicitly use '
+                'carla_mercator only with the CARLA GNSS actor'
+            ),
+        ),
+        DeclareLaunchArgument(
             'start_navigation_visualization',
             default_value='true',
         ),
@@ -122,6 +135,37 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
+            'collect_traversability_data',
+            default_value='false',
+            description=(
+                'Save raw geometric LiDAR, training-only CARLA semantic '
+                'labels, and IMU state during active F9/F10 routes'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'controlled_traversability_actor_id',
+            default_value='-1',
+            description=(
+                'CARLA semantic object_idx for one controlled actor; -1 '
+                'disables actor-specific vehicle-policy supervision'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'controlled_traversability_disposition',
+            default_value='',
+            description='Vehicle policy: obstacle, passable, or ambiguous',
+        ),
+        DeclareLaunchArgument(
+            'controlled_traversability_blueprint',
+            default_value='',
+            description='Auditable CARLA blueprint of the controlled actor',
+        ),
+        DeclareLaunchArgument(
+            'controlled_traversability_policy_source',
+            default_value='vehicle_clearance_policy',
+            description='Origin of the controlled actor disposition',
+        ),
+        DeclareLaunchArgument(
             'perception_capture',
             default_value='false',
             description=(
@@ -145,6 +189,152 @@ def generate_launch_description():
             description='Directory for stationary perception captures.',
         ),
         DeclareLaunchArgument(
+            'traversability_shadow_enabled',
+            default_value='false',
+            description=(
+                'Run the learned traversability model on isolated display '
+                'topics without navigation or safety authority'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'localization_shadow_enabled',
+            default_value='false',
+            description=(
+                'Run VN-200 plus GNSS robot_localization output in isolation; '
+                'CARLA ground-truth odometry remains the navigation source'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'localization_shadow_evaluation_enabled',
+            default_value='true',
+            description=(
+                'Compare shadow odometry with CARLA truth in an evaluator '
+                'that has no connection back to either EKF'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'localization_shadow_output_directory',
+            default_value='~/terrain_nav_data/logs/localization_shadow',
+            description='Directory for sensor-shadow localization metrics.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_checkpoint',
+            default_value=(
+                '/home/sukja/terrain_nav_data/learning/models/'
+                'traversability_pilot/v2_domain_aug/best.pt'
+            ),
+            description='Checkpoint used by the shadow traversability node.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_device',
+            default_value='auto',
+            description='Shadow inference device: auto, cpu, or cuda.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_mc_samples',
+            default_value='4',
+            description='Monte Carlo dropout samples per shadow inference.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_diagnostic_images_enabled',
+            default_value='false',
+            description=(
+                'Publish exact float probability, entropy, MC variance, and '
+                'hard-mask images for short passive audits only'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_recording_enabled',
+            default_value='true',
+            description=(
+                'Record route-level shadow metrics and sparse diagnostic '
+                'grid snapshots when shadow inference is enabled'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_output_directory',
+            default_value='~/terrain_nav_data/learning/shadow_runs',
+            description='Directory for compact shadow route recordings.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_evaluation_enabled',
+            default_value='false',
+            description=(
+                'Evaluate shadow maps against CARLA semantic LiDAR. The '
+                'semantic topic is privileged evaluation input only.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_shadow_evaluation_output_directory',
+            default_value='~/terrain_nav_data/learning/shadow_evaluations',
+            description='Directory for online semantic-evaluation results.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_evidence_v2_enabled',
+            default_value='false',
+            description=(
+                'Run the current-only 8-channel v2 evidence model on '
+                'isolated topics with no navigation authority'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_evidence_v2_checkpoint',
+            default_value=(
+                '/home/sukja/terrain_nav_data/learning/models/'
+                'traversability_evidence_v2/'
+                'cv_temporal_representation_current_only_'
+                'scenes09_11_20260921/'
+                'holdout_scene11/model/best.pt'
+            ),
+            description=(
+                'Current-only v2 evidence checkpoint used by the online '
+                'shadow node'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_evidence_v2_device',
+            default_value='auto',
+            description='Evidence v2 inference device: auto, cpu, or cuda.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_evidence_v2_mc_samples',
+            default_value='1',
+            description=(
+                'MC dropout samples; one preserves deterministic offline '
+                'evaluation parity'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_evidence_v2_diagnostics_enabled',
+            default_value='false',
+            description='Publish float v2 probability/variance images.',
+        ),
+        DeclareLaunchArgument(
+            'traversability_obstacle_authority_mode',
+            default_value='baseline',
+            description=(
+                'Selected Nav2 cloud policy: baseline, passive, or add_only. '
+                'No mode may delete baseline obstacles.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_candidate_enabled',
+            default_value='true',
+            description=(
+                'Publish a passive AI/baseline obstacle-cloud candidate when '
+                'shadow inference is enabled. The candidate is not consumed '
+                'by Nav2 or the safety gate.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'traversability_candidate_maximum_range_m',
+            default_value='20.0',
+            description=(
+                'Maximum radius where passive AI decisions may add or clear '
+                'candidate obstacle points; baseline is retained beyond it.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'evaluation_variant',
             default_value='proposed',
             description=(
@@ -153,6 +343,58 @@ def generate_launch_description():
             ),
         ),
         OpaqueFunction(function=_select_evaluation_profile),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='gnss_odometry_shadow_node',
+            name='gnss_odometry_shadow_node',
+            output='screen',
+            parameters=[
+                localization_shadow_parameters,
+                {
+                    'projection_mode': LaunchConfiguration(
+                        'gnss_projection_mode'
+                    ),
+                },
+            ],
+            condition=IfCondition(
+                LaunchConfiguration('localization_shadow_enabled')
+            ),
+        ),
+        Node(
+            package='robot_localization',
+            executable='ekf_node',
+            name='ekf_sensor_global_shadow',
+            output='screen',
+            parameters=[localization_shadow_parameters],
+            remappings=[
+                ('odometry/filtered', '/localization/odometry_shadow'),
+            ],
+            condition=IfCondition(
+                LaunchConfiguration('localization_shadow_enabled')
+            ),
+        ),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='localization_shadow_evaluator_node',
+            name='localization_shadow_evaluator_node',
+            output='screen',
+            parameters=[
+                localization_shadow_parameters,
+                {
+                    'output_directory': LaunchConfiguration(
+                        'localization_shadow_output_directory'
+                    ),
+                },
+            ],
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('localization_shadow_enabled'),
+                "' == 'true' and '",
+                LaunchConfiguration(
+                    'localization_shadow_evaluation_enabled'
+                ),
+                "' == 'true'",
+            ])),
+        ),
         Node(
             package='terrain_navigation_pkg',
             executable='gnss_goal_manager_node',
@@ -176,6 +418,9 @@ def generate_launch_description():
                     'goal_altitude': ParameterValue(
                         LaunchConfiguration('goal_altitude'),
                         value_type=float,
+                    ),
+                    'projection_mode': LaunchConfiguration(
+                        'gnss_projection_mode'
                     ),
                 },
             ],
@@ -207,6 +452,19 @@ def generate_launch_description():
             name='lidar_obstacle_filter_node',
             output='screen',
             parameters=[common_parameters, evaluation_parameters],
+        ),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='traversability_obstacle_authority_node',
+            name='traversability_obstacle_authority_node',
+            output='screen',
+            parameters=[common_parameters, {
+                'authority_mode': LaunchConfiguration(
+                    'traversability_obstacle_authority_mode'
+                ),
+            }],
+            respawn=True,
+            respawn_delay=1.0,
         ),
         Node(
             package='terrain_navigation_pkg',
@@ -383,6 +641,120 @@ def generate_launch_description():
         ),
         Node(
             package='terrain_navigation_pkg',
+            executable='traversability_shadow_node',
+            name='traversability_shadow_node',
+            output='screen',
+            parameters=[{
+                'checkpoint_path': LaunchConfiguration(
+                    'traversability_shadow_checkpoint'
+                ),
+                'device': LaunchConfiguration(
+                    'traversability_shadow_device'
+                ),
+                'mc_samples': ParameterValue(
+                    LaunchConfiguration('traversability_shadow_mc_samples'),
+                    value_type=int,
+                ),
+                'publish_diagnostic_images': ParameterValue(
+                    LaunchConfiguration(
+                        'traversability_shadow_diagnostic_images_enabled'
+                    ),
+                    value_type=bool,
+                ),
+            }],
+            condition=IfCondition(
+                LaunchConfiguration('traversability_shadow_enabled')
+            ),
+        ),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='traversability_shadow_recorder_node',
+            name='traversability_shadow_recorder_node',
+            output='screen',
+            parameters=[{
+                'output_directory': LaunchConfiguration(
+                    'traversability_shadow_output_directory'
+                ),
+            }],
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('traversability_shadow_enabled'),
+                "' == 'true' and '",
+                LaunchConfiguration(
+                    'traversability_shadow_recording_enabled'
+                ),
+                "' == 'true'",
+            ])),
+        ),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='traversability_obstacle_candidate_node',
+            name='traversability_obstacle_candidate_node',
+            output='screen',
+            parameters=[common_parameters, {
+                'maximum_range_m': ParameterValue(
+                    LaunchConfiguration(
+                        'traversability_candidate_maximum_range_m'
+                    ),
+                    value_type=float,
+                ),
+            }],
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('traversability_shadow_enabled'),
+                "' == 'true' and '",
+                LaunchConfiguration('traversability_candidate_enabled'),
+                "' == 'true'",
+            ])),
+        ),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='traversability_evidence_shadow_node',
+            name='traversability_evidence_shadow_node',
+            output='screen',
+            parameters=[common_parameters, {
+                'checkpoint_path': LaunchConfiguration(
+                    'traversability_evidence_v2_checkpoint'
+                ),
+                'device': LaunchConfiguration(
+                    'traversability_evidence_v2_device'
+                ),
+                'mc_samples': ParameterValue(
+                    LaunchConfiguration(
+                        'traversability_evidence_v2_mc_samples'
+                    ),
+                    value_type=int,
+                ),
+                'publish_diagnostic_images': ParameterValue(
+                    LaunchConfiguration(
+                        'traversability_evidence_v2_diagnostics_enabled'
+                    ),
+                    value_type=bool,
+                ),
+            }],
+            condition=IfCondition(
+                LaunchConfiguration('traversability_evidence_v2_enabled')
+            ),
+        ),
+        Node(
+            package='terrain_navigation_pkg',
+            executable='traversability_shadow_evaluator_node',
+            name='traversability_shadow_evaluator_node',
+            output='screen',
+            parameters=[{
+                'output_directory': LaunchConfiguration(
+                    'traversability_shadow_evaluation_output_directory'
+                ),
+            }],
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('traversability_shadow_enabled'),
+                "' == 'true' and '",
+                LaunchConfiguration(
+                    'traversability_shadow_evaluation_enabled'
+                ),
+                "' == 'true'",
+            ])),
+        ),
+        Node(
+            package='terrain_navigation_pkg',
             executable='navigation_learning_recorder_node',
             name='navigation_learning_recorder_node',
             output='screen',
@@ -409,12 +781,47 @@ def generate_launch_description():
                     # Keep normal F9/F10 evaluation lightweight.  Capture
                     # mode alone saves the raw cloud and BEV/costmap arrays.
                     'save_sample_files': ParameterValue(
-                        LaunchConfiguration('perception_capture'),
+                        PythonExpression([
+                            "'", LaunchConfiguration('perception_capture'),
+                            "' == 'true' or '",
+                            LaunchConfiguration('collect_traversability_data'),
+                            "' == 'true'",
+                        ]),
                         value_type=bool,
                     ),
                     'save_raw_points': ParameterValue(
-                        LaunchConfiguration('perception_capture'),
+                        PythonExpression([
+                            "'", LaunchConfiguration('perception_capture'),
+                            "' == 'true' or '",
+                            LaunchConfiguration('collect_traversability_data'),
+                            "' == 'true'",
+                        ]),
                         value_type=bool,
+                    ),
+                    'save_semantic_labels': ParameterValue(
+                        LaunchConfiguration('collect_traversability_data'),
+                        value_type=bool,
+                    ),
+                    'controlled_traversability_actor_id': ParameterValue(
+                        LaunchConfiguration(
+                            'controlled_traversability_actor_id'
+                        ),
+                        value_type=int,
+                    ),
+                    'controlled_traversability_disposition': (
+                        LaunchConfiguration(
+                            'controlled_traversability_disposition'
+                        )
+                    ),
+                    'controlled_traversability_blueprint': (
+                        LaunchConfiguration(
+                            'controlled_traversability_blueprint'
+                        )
+                    ),
+                    'controlled_traversability_policy_source': (
+                        LaunchConfiguration(
+                            'controlled_traversability_policy_source'
+                        )
                     ),
                 },
             ],

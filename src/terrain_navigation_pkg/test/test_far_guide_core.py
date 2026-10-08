@@ -11,6 +11,7 @@ from terrain_navigation_pkg.far_guide_core import add_failed_corridor_cost
 from terrain_navigation_pkg.far_guide_core import bounded_heading_preference
 from terrain_navigation_pkg.far_guide_core import can_accept_bounded_topology_escape
 from terrain_navigation_pkg.far_guide_core import can_accept_length_only_detour
+from terrain_navigation_pkg.far_guide_core import is_actionable_safety_stop
 from terrain_navigation_pkg.far_guide_core import PathEfficiencyAssessment
 from terrain_navigation_pkg.far_guide_core import line_of_sight
 from terrain_navigation_pkg.far_guide_core import nearest_polyline_tangent
@@ -19,9 +20,13 @@ from terrain_navigation_pkg.far_guide_core import polylines_similar
 from terrain_navigation_pkg.far_guide_core import prefix_polyline_to_point
 from terrain_navigation_pkg.far_guide_core import remaining_polyline_length
 from terrain_navigation_pkg.far_guide_core import retry_lookahead_distance
+from terrain_navigation_pkg.far_guide_core import SafetyRejectionMonitor
+from terrain_navigation_pkg.far_guide_core import SafetyReplanHold
 from terrain_navigation_pkg.far_guide_core import select_direction_continuity
 from terrain_navigation_pkg.far_guide_core import select_subgoal
-from terrain_navigation_pkg.far_guide_core import should_request_costmap_recovery
+from terrain_navigation_pkg.far_guide_core import (
+    should_request_costmap_recovery,
+)
 
 
 def _grid(occupancy, resolution=1.0, stride=1):
@@ -550,12 +555,29 @@ def test_small_guide_jitter_does_not_request_active_replan():
     assert assessment is None
 
 
-def test_persistent_blocked_path_is_eligible_even_without_length_gain():
+def test_blocked_path_jitter_does_not_cancel_the_active_action():
     assessment = assess_active_replan(
         active_path=[(0.0, 0.0), (10.0, 0.0)],
         active_subgoal=(8.0, 0.0),
         candidate_path=[(0.0, 0.0), (10.0, 0.0)],
-        candidate_subgoal=(8.0, 0.0),
+        candidate_subgoal=(9.5, 0.0),
+        current=(1.0, 0.0),
+        path_blocked=True,
+        minimum_subgoal_change_m=3.0,
+        minimum_improvement_m=3.0,
+        endpoint_tolerance_m=2.0,
+        allow_valid_path_optimization=False,
+    )
+
+    assert assessment is None
+
+
+def test_blocked_path_accepts_a_materially_different_corridor():
+    assessment = assess_active_replan(
+        active_path=[(0.0, 0.0), (10.0, 0.0)],
+        active_subgoal=(8.0, 0.0),
+        candidate_path=[(0.0, 0.0), (0.0, 8.0), (10.0, 0.0)],
+        candidate_subgoal=(0.0, 8.0),
         current=(1.0, 0.0),
         path_blocked=True,
         minimum_subgoal_change_m=3.0,
@@ -713,6 +735,70 @@ def test_costmap_recovery_requires_all_independent_clear_signals():
     assert not should_request_costmap_recovery(
         **dict(arguments, speed_mps=0.5)
     )
+
+
+def test_safety_rejection_monitor_requires_distinct_scans_in_window():
+    monitor = SafetyRejectionMonitor(3, 1.0)
+
+    assert not monitor.observe(10.0, 100)
+    assert not monitor.observe(10.1, 100)
+    assert not monitor.observe(10.2, 101)
+    assert monitor.observe(10.3, 102)
+    assert monitor.count == 3
+
+
+def test_safety_rejection_monitor_restarts_after_window_expires():
+    monitor = SafetyRejectionMonitor(2, 0.5)
+
+    assert not monitor.observe(10.0, 100)
+    assert not monitor.observe(10.7, 101)
+    assert monitor.count == 1
+    assert monitor.observe(10.8, 102)
+
+
+def test_safety_rejection_monitor_reset_discards_old_evidence():
+    monitor = SafetyRejectionMonitor(2, 1.0)
+    assert not monitor.observe(10.0, 100)
+
+    monitor.reset()
+
+    assert not monitor.observe(10.1, 101)
+    assert monitor.count == 1
+
+
+def test_only_fresh_obstacle_stop_authorizes_safety_replan():
+    assert is_actionable_safety_stop('obstacle_stop', 0.05, 1.5)
+    assert not is_actionable_safety_stop('obstacle_recovery', 0.05, 1.5)
+    assert not is_actionable_safety_stop('obstacle_caution', 0.05, 1.5)
+    assert not is_actionable_safety_stop('clear', 0.05, 1.5)
+    assert not is_actionable_safety_stop('obstacle_stop', 1.51, 1.5)
+
+
+def test_safety_replan_hold_requires_consecutive_clear_states():
+    hold = SafetyReplanHold(3, 1.0)
+    hold.arm(10.0)
+
+    hold.observe_state('clear')
+    hold.observe_state('obstacle_recovery')
+    hold.observe_state('clear')
+    hold.observe_state('clear')
+    assert hold.release_reason(10.5) is None
+
+    hold.observe_state('clear')
+    assert hold.release_reason(10.6) == 'clear_confirmed'
+
+
+def test_safety_replan_hold_has_bounded_timeout():
+    hold = SafetyReplanHold(3, 1.0)
+    hold.arm(20.0)
+    hold.observe_state('obstacle_stop')
+
+    assert hold.release_reason(20.99) is None
+    assert hold.release_reason(21.0) == 'timeout'
+
+    hold.reset()
+    assert not hold.active
+    assert hold.release_reason(22.0) == 'inactive'
 
 
 def test_path_efficiency_uses_far_reference_not_blocked_direct_distance():

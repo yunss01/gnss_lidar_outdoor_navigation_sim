@@ -21,6 +21,12 @@ results/
 *.mp4
 *.webm
 
+# Local sensor metadata and credentials (do not publish device-specific files)
+*-metadata.json
+.env
+.env.*
+credentials*
+
 # Editor and operating-system files
 .vscode/
 .idea/
