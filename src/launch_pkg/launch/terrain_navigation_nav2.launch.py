@@ -44,16 +44,18 @@ def _select_evaluation_profile(context):
 
 def generate_launch_description():
     config_share = FindPackageShare('config_pkg')
-    common_parameters = PathJoinSubstitution([
+    default_common_parameters = PathJoinSubstitution([
         config_share,
         'config',
         'params.yaml',
     ])
-    nav2_parameters = PathJoinSubstitution([
+    default_nav2_parameters = PathJoinSubstitution([
         config_share,
         'config',
         'nav2_outdoor_params.yaml',
     ])
+    common_parameters = LaunchConfiguration('common_parameters_file')
+    nav2_parameters = LaunchConfiguration('nav2_parameters_file')
     localization_shadow_parameters = PathJoinSubstitution([
         config_share,
         'config',
@@ -80,6 +82,15 @@ def generate_launch_description():
         'nav2_ackermann_through_poses_replanning.xml',
     ])
     return LaunchDescription([
+        # Opt-in experiment overrides. Defaults remain the original files
+        # and time base; normal F9/F10 behaviour is not changed.
+        DeclareLaunchArgument(
+            'common_parameters_file', default_value=default_common_parameters,
+        ),
+        DeclareLaunchArgument(
+            'nav2_parameters_file', default_value=default_nav2_parameters,
+        ),
+        DeclareLaunchArgument('navigation_use_sim_time', default_value='false'),
         DeclareLaunchArgument(
             'drive_enabled',
             default_value='false',
@@ -585,7 +596,10 @@ def generate_launch_description():
             name='lifecycle_manager_navigation',
             output='screen',
             parameters=[{
-                'use_sim_time': False,
+                'use_sim_time': ParameterValue(
+                    LaunchConfiguration('navigation_use_sim_time'),
+                    value_type=bool,
+                ),
                 'autostart': True,
                 'node_names': [
                     'controller_server',

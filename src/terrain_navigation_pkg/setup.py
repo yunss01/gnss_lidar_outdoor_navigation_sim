@@ -31,6 +31,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'simulation_experiment = '
+            'terrain_navigation_pkg.simulation_experiment:main',
             'gnss_goal_manager_node = '
             'terrain_navigation_pkg.gnss_goal_manager_node:main',
             'gnss_waypoint_manager_node = '
