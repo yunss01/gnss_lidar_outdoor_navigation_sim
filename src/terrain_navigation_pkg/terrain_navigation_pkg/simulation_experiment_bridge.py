@@ -18,6 +18,7 @@ import sys
 import uuid
 
 from .simulation_experiment_core import (
+    COMMAND_MODES,
     position_fault,
     PROFILES,
     rotate_quaternion_yaw,
@@ -31,7 +32,9 @@ def inspect_client(path):
     source = Path(path).read_text(encoding='utf-8')
     tree = ast.parse(source)
     required = {
-        'CarlaRos2Publisher': {'publish_vehicle_speed', 'external_command'},
+        'CarlaRos2Publisher': {
+            'publish_vehicle_speed', 'external_command', '_on_command',
+            'close'},
         'KeyboardControl': {'_apply_external_control'},
         'World': {'_load_waypoint_route', '_load_navigation_goal'},
     }
@@ -67,6 +70,36 @@ class PublisherTap:
 
     def __getattr__(self, name):
         return getattr(self.publisher, name)
+
+
+class LatestCommandReceiver:
+    """One command-only executor, polled once immediately before control.
+
+    KEEP_LAST(1) drops superseded setpoints, never invents a command. This is
+    deliberately NOT a thread, a second publisher, or a brake override.
+    Twist has no source stamp: receipt age is NOT publisher-to-actuator age.
+    """
+
+    def __init__(self, callback, context, topic):
+        from geometry_msgs.msg import Twist
+        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.node import Node
+        from rclpy.qos import QoSProfile
+        self.node = Node('experiment_command_receiver', context=context,
+                         use_global_arguments=False)
+        self.executor = SingleThreadedExecutor(context=context)
+        self.subscription = self.node.create_subscription(
+            Twist, topic, callback, QoSProfile(depth=1))
+        self.executor.add_node(self.node)
+
+    def poll(self):
+        # There is only ONE subscription and no timers/UI callbacks here.
+        self.executor.spin_once(timeout_sec=0.0)
+
+    def close(self):
+        self.executor.remove_node(self.node)
+        self.executor.shutdown(timeout_sec=0.0)
+        self.node.destroy_node()
 
 
 class TfTap:
@@ -128,6 +161,9 @@ class PlayerTap:
         bridge._experiment_steer_requested = requested
         bridge._experiment_steer_applied = steer
         bridge._experiment_brake = float(applied.brake)
+        bridge._experiment_throttle = float(applied.throttle)
+        bridge._experiment_control_sequence += 1
+        bridge._experiment_control_time_s = bridge._experiment_time_s
         return self.player.apply_control(applied)
 
 
@@ -153,13 +189,16 @@ class RealtimeClock:
         return getattr(self.clock, name)
 
 
-def install_adapter(module, profile, source_sha):
+def install_adapter(module, profile, source_sha, command_mode='legacy'):
+    if command_mode not in COMMAND_MODES:
+        raise ValueError('unknown command mode: ' + str(command_mode))
     original_bridge = module.CarlaRos2Publisher
     original_control = module.KeyboardControl._apply_external_control
 
     class ExperimentBridge(original_bridge):
 
         def __init__(self, *args, **kwargs):
+            self._experiment_receiver = None
             self._experiment_armed = False
             self._experiment_run_id = ''
             self._experiment_time_s = 0.0
@@ -170,6 +209,11 @@ def install_adapter(module, profile, source_sha):
             self._experiment_steer_requested = 0.0
             self._experiment_steer_applied = 0.0
             self._experiment_brake = 1.0
+            self._experiment_throttle = 0.0
+            self._experiment_control_sequence = 0
+            self._experiment_control_time_s = 0.0
+            self._experiment_command_rx_count = 0
+            self._experiment_accepted_command = None
             self._experiment_session = uuid.uuid4().hex
             sensor = getattr(module, 'SENSOR_PROFILE', None)
             self._experiment_sensor_profile = (asdict(sensor)
@@ -178,6 +222,14 @@ def install_adapter(module, profile, source_sha):
             if not self.enabled or not self.external_control_enabled:
                 raise RuntimeError(
                     'experiment requires the ROS external-control bridge')
+            if command_mode == 'latest':
+                if not self.node.destroy_subscription(
+                        self.command_subscription):
+                    raise RuntimeError('cannot replace command subscription')
+                self.command_subscription = None
+                self._experiment_receiver = LatestCommandReceiver(
+                    self._on_command, self.node.context,
+                    module.EXTERNAL_CONTROL_TOPIC)
             from std_msgs.msg import String
             self._experiment_truth_publisher = self.node.create_publisher(
                 module.Odometry, '/experiment/truth_odometry', 10)
@@ -215,12 +267,25 @@ def install_adapter(module, profile, source_sha):
                 self.node.get_logger().error(
                     f'experiment control rejected: {error}')
 
+        def _on_command(self, message):
+            self._experiment_command_rx_count += 1
+            return super()._on_command(message)
+
         def external_command(self):
+            if self._experiment_receiver is not None:
+                self._experiment_receiver.poll()
             # Explicit start is required; after stop, residual Nav2 commands
             # cannot make the car resume. Original stale-command brake remains.
-            if not self._experiment_armed:
-                return None
-            return super().external_command()
+            command = (super().external_command()
+                       if self._experiment_armed else None)
+            self._experiment_accepted_command = command
+            return command
+
+        def close(self):
+            if self._experiment_receiver is not None:
+                self._experiment_receiver.close()
+                self._experiment_receiver = None
+            return super().close()
 
         def _experiment_odometry(self, message):
             truth = copy.deepcopy(message)
@@ -246,6 +311,8 @@ def install_adapter(module, profile, source_sha):
                     'adapter_session': self._experiment_session,
                     'profile': profile.name,
                     'profile_parameters': profile.to_dict(),
+                    'command_mode': command_mode,
+                    'command_telemetry_version': 1,
                     'manual_client_sha256': source_sha,
                     'sensor_profile': self._experiment_sensor_profile,
                     'armed': self._experiment_armed,
@@ -258,6 +325,21 @@ def install_adapter(module, profile, source_sha):
                     'steer_requested': self._experiment_steer_requested,
                     'steer_applied': self._experiment_steer_applied,
                     'brake': self._experiment_brake,
+                    'throttle': self._experiment_throttle,
+                    'control_sequence': self._experiment_control_sequence,
+                    'control_sim_time_s': self._experiment_control_time_s,
+                    'command_rx_count': self._experiment_command_rx_count,
+                    'accepted_command_speed_mps': (
+                        self._experiment_accepted_command[0]
+                        if self._experiment_accepted_command else None),
+                    'accepted_command_yaw_rate_rps': (
+                        self._experiment_accepted_command[1]
+                        if self._experiment_accepted_command else None),
+                    'accepted_command_wall_age_s': (
+                        # Age of the setpoint actually consumed by the LAST
+                        # control call, not a fresh re-query during logging.
+                        self._experiment_accepted_command[2]
+                        if self._experiment_accepted_command else None),
                     'navigation_pose_source': (
                         'synthetic_oracle_with_optional_bias'),
                     'truth_has_navigation_tf': False,
@@ -302,6 +384,9 @@ def main(argv=None):
     parser.add_argument('--profile',
                         choices=sorted(PROFILES),
                         default='baseline')
+    parser.add_argument('--command-mode', choices=COMMAND_MODES,
+                        default='legacy',
+                        help='legacy callback queue or latest-only receiver')
     parser.add_argument('--anchor', help='previously captured anchor JSON')
     parser.add_argument('--auto-straight-start', action='store_true')
     parser.add_argument('--start-candidate', type=int, default=1)
@@ -318,7 +403,8 @@ def main(argv=None):
                 {
                     'compatible': True,
                     'manual_client_sha256': source_sha,
-                    'profile': PROFILES[options.profile].to_dict()
+                    'profile': PROFILES[options.profile].to_dict(),
+                    'command_mode': options.command_mode,
                 },
                 indent=2))
         return 0
@@ -380,7 +466,8 @@ def main(argv=None):
                                                   client_file)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    install_adapter(module, PROFILES[options.profile], source_sha)
+    install_adapter(module, PROFILES[options.profile], source_sha,
+                    options.command_mode)
     original_clock = module.pygame.time.Clock
     module.pygame.time.Clock = lambda: RealtimeClock(original_clock(), 20)
     sys.argv = [str(client_file)] + remaining

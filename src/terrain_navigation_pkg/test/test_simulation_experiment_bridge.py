@@ -8,6 +8,7 @@ import ast
 import copy
 import json
 import math
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,11 +46,16 @@ class Collector:
 
 class FakeNode:
 
+    context = None
+
     def create_publisher(self, *_args):
         return Collector()
 
     def create_subscription(self, *_args):
         return None
+
+    def destroy_subscription(self, _subscription):
+        return True
 
     def get_logger(self):
         return SimpleNamespace(error=lambda _text: None)
@@ -79,6 +85,7 @@ def module_fixture():
     from std_msgs.msg import Float32
     namespace = {
         'math': math,
+        'time': time,
         'TransformStamped': TransformStamped,
         'Odometry': Odometry,
         'TwistStamped': TwistStamped,
@@ -89,6 +96,7 @@ def module_fixture():
         'EXTERNAL_CONTROL_WHEELBASE_M': 2.85,
         'EXTERNAL_CONTROL_MAX_SPEED_KMH': 12,
         'EXTERNAL_CONTROL_MAX_STEERING_ANGLE_RAD': math.radians(35),
+        'EXTERNAL_CONTROL_TIMEOUT_SECONDS': 0.5,
     }
     tree = ast.parse(CLIENT.read_text())
     names = {
@@ -101,6 +109,8 @@ def module_fixture():
     ]
     for class_name, method_name in [
         ('CarlaRos2Publisher', 'publish_vehicle_speed'),
+        ('CarlaRos2Publisher', '_on_command'),
+        ('CarlaRos2Publisher', 'external_command'),
         ('KeyboardControl', '_apply_external_control')
     ]:
         class_ast = next(
@@ -121,6 +131,7 @@ def module_fixture():
             self.node = FakeNode()
             self.external_control_enabled = True
             self.command = (1.0, 0.2, 0)
+            self.command_subscription = object()
             for key in ('odometry_publisher', 'velocity_publisher',
                         'speed_publisher', 'clock_publisher',
                         'tf_broadcaster'):
@@ -129,6 +140,12 @@ def module_fixture():
         def external_command(self):
             return self.command
 
+        def _on_command(self, message):
+            self.command = (message.linear.x, message.angular.z, 0.0)
+
+        def close(self):
+            self.closed = True
+
     BaseBridge.publish_vehicle_speed = namespace['publish_vehicle_speed']
     control_class = type(
         'KeyboardControl', (),
@@ -136,6 +153,9 @@ def module_fixture():
     return SimpleNamespace(CarlaRos2Publisher=BaseBridge,
                            KeyboardControl=control_class,
                            carla=SimpleNamespace(VehicleControl=Control),
+                           EXTERNAL_CONTROL_TOPIC='/cmd_vel',
+                           raw_on_command=namespace['_on_command'],
+                           raw_external_command=namespace['external_command'],
                            Odometry=Odometry,
                            ODOMETRY_FRAME_ID='odom',
                            VEHICLE_FRAME_ID='base_link')
@@ -247,6 +267,123 @@ def test_stop_event_latches_client_against_residual_nav_commands():
         })))
     assert bridge.external_command() is None
     assert bridge.command is not None
+
+
+def test_latest_polls_before_original_control_and_stop_cannot_resume(
+        monkeypatch):
+    from geometry_msgs.msg import Twist
+    from std_msgs.msg import String
+    receivers = []
+
+    class Receiver:
+        def __init__(self, callback, context, topic):
+            assert topic == '/cmd_vel'
+            self.callback, self.pending, self.closed = callback, None, False
+            receivers.append(self)
+
+        def poll(self):
+            if self.pending is not None:
+                self.callback(self.pending)
+                self.pending = None
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(bridge_cli, 'LatestCommandReceiver', Receiver)
+    module = module_fixture()
+    install_adapter(module, PROFILES['steering_both'], inspect_client(CLIENT),
+                    command_mode='latest')
+    bridge = module.CarlaRos2Publisher()
+    vehicle = Vehicle()
+    controller = module.KeyboardControl()
+    controller._control = Control()
+    controller._external_speed_controller = SimpleNamespace(
+        reset=lambda: None, run_step=lambda *_args: (.2, 0))
+    world = SimpleNamespace(
+        sensor_ros=bridge, player=vehicle,
+        world=SimpleNamespace(get_settings=lambda: SimpleNamespace(
+            fixed_delta_seconds=.05)))
+    start(bridge, 'steering_both')
+    bridge.publish_vehicle_speed(vehicle, 10)
+    receivers[0].pending = Twist()  # Fresh STOP replaces queued motion.
+    controller._apply_external_control(world, None)
+    assert vehicle.controls[-1].brake == 1.0
+    assert vehicle.controls[-1].throttle == 0
+    assert vehicle.controls[-1].steer == 0
+    assert bridge._experiment_command_rx_count == 1
+    bridge.publish_vehicle_speed(vehicle, 10.05)
+    status = json.loads(bridge._experiment_status_publisher.messages[-1].data)
+    assert status['command_mode'] == 'latest'
+    assert status['command_telemetry_version'] == 1
+    assert status['accepted_command_speed_mps'] == 0
+    assert status['accepted_command_yaw_rate_rps'] == 0
+    assert status['control_sequence'] == 1
+    assert status['control_sim_time_s'] == 10
+    bridge._experiment_control(String(data=json.dumps(
+        dict(event='stop', run_id='trial'))))
+    move = Twist()
+    move.linear.x = 1.0
+    receivers[0].pending = move
+    controller._apply_external_control(world, None)
+    assert vehicle.controls[-1].brake == 1
+    assert bridge._experiment_accepted_command is None
+    bridge.close()
+    bridge.close()  # Dedicated executor closed once, before base shutdown.
+    assert receivers[0].closed and bridge.closed
+
+
+def test_original_command_watchdog_preserves_receipt_age(monkeypatch):
+    from geometry_msgs.msg import Twist
+    module = module_fixture()
+    now = [10.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+    state = SimpleNamespace(external_control_enabled=True,
+                            command_wall_time=None)
+    assert module.raw_external_command(state) is None
+    message = Twist()
+    message.linear.x, message.angular.z = 1.0, .2
+    module.raw_on_command(state, message)
+    assert module.raw_external_command(state) == (1.0, .2, 0)
+    now[0] = 10.51
+    assert module.raw_external_command(state) is None
+
+
+def test_latest_control_still_brakes_on_original_watchdog(monkeypatch):
+    from geometry_msgs.msg import Twist
+    now = [10.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(bridge_cli, 'LatestCommandReceiver',
+                        lambda *_args: SimpleNamespace(poll=lambda: None))
+    module = module_fixture()
+    # Execute the original receipt/watchdog bodies, not the fixture's fake
+    # constant command. Only the DDS transport is replaced in this unit test.
+    module.CarlaRos2Publisher._on_command = module.raw_on_command
+    module.CarlaRos2Publisher.external_command = module.raw_external_command
+    install_adapter(module, PROFILES['steering_delay'], inspect_client(CLIENT),
+                    command_mode='latest')
+    bridge = module.CarlaRos2Publisher()
+    bridge.command_wall_time = None
+    start(bridge, 'steering_delay')
+    vehicle = Vehicle()
+    controller = module.KeyboardControl()
+    controller._control = Control()
+    controller._external_speed_controller = SimpleNamespace(
+        reset=lambda: None, run_step=lambda *_args: (.2, 0))
+    world = SimpleNamespace(
+        sensor_ros=bridge, player=vehicle,
+        world=SimpleNamespace(get_settings=lambda: SimpleNamespace(
+            fixed_delta_seconds=.05)))
+    move = Twist()
+    move.linear.x, move.angular.z = 1.0, .2
+    bridge._on_command(move)
+    controller._apply_external_control(world, None)
+    assert vehicle.controls[-1].throttle == .2
+    now[0] += .51  # Polling/logging must NOT renew receipt age.
+    controller._apply_external_control(world, None)
+    assert vehicle.controls[-1].throttle == 0
+    assert vehicle.controls[-1].brake == 1
+    assert vehicle.controls[-1].steer == 0
+    assert bridge._experiment_accepted_command is None
 
 
 def test_wrong_profile_cannot_arm_the_client():

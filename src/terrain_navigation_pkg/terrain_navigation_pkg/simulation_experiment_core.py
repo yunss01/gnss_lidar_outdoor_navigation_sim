@@ -10,6 +10,18 @@ import math
 
 SCHEMA_VERSION = 1
 SCENARIOS = ('S0', 'S1', 'S2', 'S3')
+NAVIGATION_VARIANTS = ('baseline', 'rejoin')
+COMMAND_MODES = ('legacy', 'latest')
+
+
+def navigation_variant_parameters(name):
+    """One explicit treatment; ordinary navigation defaults remain disabled."""
+    if name not in NAVIGATION_VARIANTS:
+        raise ValueError('unknown navigation variant: ' + str(name))
+    return {
+        'terminal_approach_distance_m': 8.0 if name == 'rejoin' else 0.0,
+        'terminal_approach_capture_m': 1.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -27,16 +39,22 @@ class FaultProfile:
 
 
 PROFILES = {
-    'baseline': FaultProfile('baseline'),
-    'steering_steps': FaultProfile('steering_steps', steering_half_steps=7),
-    'steering_delay': FaultProfile('steering_delay', steering_delay_s=0.2),
-    'steering_both': FaultProfile('steering_both',
-                                  steering_half_steps=7,
-                                  steering_delay_s=0.2),
-    'position_left': FaultProfile('position_left', lateral_bias_m=0.3),
-    'position_right': FaultProfile('position_right', lateral_bias_m=-0.3),
-    'yaw_left': FaultProfile('yaw_left', yaw_bias_deg=3.0),
-    'yaw_right': FaultProfile('yaw_right', yaw_bias_deg=-3.0),
+    'baseline':
+    FaultProfile('baseline'),
+    'steering_steps':
+    FaultProfile('steering_steps', steering_half_steps=7),
+    'steering_delay':
+    FaultProfile('steering_delay', steering_delay_s=0.2),
+    'steering_both':
+    FaultProfile('steering_both', steering_half_steps=7, steering_delay_s=0.2),
+    'position_left':
+    FaultProfile('position_left', lateral_bias_m=0.3),
+    'position_right':
+    FaultProfile('position_right', lateral_bias_m=-0.3),
+    'yaw_left':
+    FaultProfile('yaw_left', yaw_bias_deg=3.0),
+    'yaw_right':
+    FaultProfile('yaw_right', yaw_bias_deg=-3.0),
 }
 
 
@@ -45,6 +63,14 @@ def finite(value, name='value'):
     if not math.isfinite(number):
         raise ValueError(f'{name} must be finite')
     return number
+
+
+def validate_arrival_radius(value):
+    """Bound this experiment's control setting, not its scoring threshold."""
+    radius = finite(value, 'arrival_radius_m')
+    if not 1.0 <= radius <= 3.0:
+        raise ValueError('arrival_radius_m must be in [1.0, 3.0] m')
+    return radius
 
 
 def wrap_angle(value):
@@ -216,18 +242,45 @@ def _percentile(values, fraction):
 def evaluate_trial(metadata, frames):
     """Keep collision, expected stop, goal arrival and recovery separate."""
     result = {
-        'schema_version': SCHEMA_VERSION,
-        'run_id': metadata['run_id'],
-        'scenario': metadata['scenario'],
-        'profile': metadata['profile'],
-        'termination': metadata['termination'],
-        'success': False,
-        'collision': False,
-        'expected_stop': False,
-        'goal_arrived': False,
-        'recovered': False,
-        'metrics_valid': False,
-        'samples': len(frames),
+        'schema_version':
+        SCHEMA_VERSION,
+        'run_id':
+        metadata['run_id'],
+        'scenario':
+        metadata['scenario'],
+        'profile':
+        metadata['profile'],
+        'termination':
+        metadata['termination'],
+        'success':
+        False,
+        'collision':
+        False,
+        'expected_stop':
+        False,
+        'goal_arrived':
+        False,
+        'recovered':
+        False,
+        'metrics_valid':
+        False,
+        'samples':
+        len(frames),
+        'requested_arrival_radius_m':
+        metadata.get('requested_arrival_radius_m'),
+        'active_arrival_radius_m':
+        metadata.get('active_arrival_radius_m'),
+        'arrival_radius_verified':
+        metadata.get('arrival_radius_verified', False),
+        'navigation_variant': metadata.get('navigation_variant', 'unrecorded'),
+        'navigation_variant_verified': metadata.get(
+            'navigation_variant_verified', False),
+        'command_mode': metadata.get('command_mode', 'unrecorded'),
+        'command_mode_verified': metadata.get('command_mode_verified', False),
+        'halt_acknowledged': metadata.get('halt_acknowledged'),
+        'vehicle_stopped_after_halt': metadata.get(
+            'vehicle_stopped_after_halt'),
+        'shutdown_confirmed': metadata.get('halt_confirmation_complete'),
         'limitations': [
             'clearance uses oriented bounding boxes, not mesh',
             'synthetic faults are not calibrated real sensors'
@@ -258,24 +311,26 @@ def evaluate_trial(metadata, frames):
     # Gate status is a retained change event, not a periodic heartbeat.
     # Require its state while driving, but never interpret event age as loss.
     issues = {
-        'sample_gap': sum(not 0 < gap <= 0.5 for gap in gaps),
-        'tf_mismatch': sum(not bool(int(row.get('tf_consistent', 1)))
-                           for row in frames),
-        'path_gate_state_missing_while_moving': sum(
-            not row.get('path_gate_state') and
-            (abs(float(row['speed_mps'])) > 0.05 or
-             abs(float(row.get('command_speed_mps', 0))) > 0.05)
+        'sample_gap':
+        sum(not 0 < gap <= 0.5 for gap in gaps),
+        'tf_mismatch':
+        sum(not bool(int(row.get('tf_consistent', 1))) for row in frames),
+        'path_gate_state_missing_while_moving':
+        sum(not row.get('path_gate_state') and (
+            abs(float(row['speed_mps'])) > 0.05
+            or abs(float(row.get('command_speed_mps', 0))) > 0.05)
             for row in frames),
-        'final_path_gate_state_missing': int(
-            not frames[-1].get('path_gate_state')),
+        'final_path_gate_state_missing':
+        int(not frames[-1].get('path_gate_state')),
     }
-    for name, limit in (
-            ('lidar_age_s', 0.5), ('command_age_s', 0.5),
-            ('safety_state_age_s', 0.5), ('bridge_status_age_s', 0.2)):
+    for name, limit in (('lidar_age_s', 0.5), ('command_age_s', 0.5),
+                        ('safety_state_age_s', 0.5), ('bridge_status_age_s',
+                                                      0.2)):
         issues[name] = sum(not float(row.get(name, 0)) <= limit
                            for row in frames)
     result['recording_issues'] = {
-        name: count for name, count in issues.items() if count
+        name: count
+        for name, count in issues.items() if count
     }
     data_valid = not result['recording_issues']
     result['metrics_valid'] = data_valid
@@ -292,6 +347,32 @@ def evaluate_trial(metadata, frames):
     result['final_goal_error_m'] = float(frames[-1]['goal_error_m'])
     result['final_heading_error_deg'] = abs(
         float(frames[-1]['heading_error_deg']))
+    # Diagnostics only: keep the historical truth-based 3 m scoring contract.
+    # GNSS uses the antenna, not the vehicle body; do not compare these
+    # distances as though they had the same measurement origin.
+    navigation_distances = []
+    navigation_reached = False
+    for row in frames:
+        # A also emits reached=True near zero metres. Do not confuse that
+        # initial waypoint with arrival near the final waypoint B.
+        if float(row['goal_error_m']) > 3.0:
+            continue
+        try:
+            distance = finite(row['navigation_goal_distance_m'])
+            distance_age = finite(row['navigation_goal_distance_age_s'])
+            reached_age = finite(row['navigation_goal_reached_age_s'])
+            if distance >= 0 and 0 <= distance_age <= 0.5:
+                navigation_distances.append(distance)
+            if 0 <= reached_age <= 0.5:
+                navigation_reached |= str(
+                    row['navigation_goal_reached']) == '1'
+        except (KeyError, TypeError, ValueError):
+            continue
+    result['minimum_navigation_goal_distance_m'] = (
+        min(navigation_distances) if navigation_distances else None)
+    result['navigation_goal_reached_observed'] = navigation_reached
+    result['route_completed_observed'] = any(
+        row.get('route_status') == 'completed' for row in frames)
     result['maximum_progress_m'] = max(
         float(row['along_track_m']) for row in frames)
     result['maximum_observed_pose_bias_m'] = max(
@@ -324,6 +405,11 @@ def evaluate_trial(metadata, frames):
         for a, b in zip(frames, frames[1:]))
     stop_total = stop_longest = stop_run = 0.0
     recovery_start = passage_time = recovery_confirmed = None
+    recovery_confirmed_at = moving_start = None
+    moving_confirmed_at = None
+    moving_recovery_before_completion = False
+    completed_at = next((float(row['sim_time_s']) for row in frames
+                         if row.get('route_status') == 'completed'), None)
     blocked_run = blocked_longest = 0.0
     post_clearance = metadata.get('obstacle_passage_s_m')
     for index, row in enumerate(frames):
@@ -345,8 +431,23 @@ def evaluate_trial(metadata, frames):
             if float(row['sim_time_s']) - recovery_start >= 2:
                 if recovery_confirmed is None:
                     recovery_confirmed = recovery_start
+                    recovery_confirmed_at = float(row['sim_time_s'])
         else:
             recovery_start = None
+        moving_aligned = (
+            aligned and abs(float(row['speed_mps'])) >= 0.2
+            and completed_at is not None
+            and float(row['sim_time_s']) < completed_at
+            and (index == 0 or 0 < gaps[index - 1] <= 0.5))
+        if moving_aligned:
+            if moving_start is None:
+                moving_start = float(row['sim_time_s'])
+            if float(row['sim_time_s']) - moving_start >= 2.0:
+                moving_recovery_before_completion = True
+                if moving_confirmed_at is None:
+                    moving_confirmed_at = float(row['sim_time_s'])
+        else:
+            moving_start = None
         reason = str(row.get('path_gate_state', '')).lower()
         explainable = str(row.get(
             'safety_state', '')) == 'obstacle_stop' or ('invalid' in reason
@@ -366,6 +467,13 @@ def evaluate_trial(metadata, frames):
     result['recovered'] = recovery_confirmed is not None
     result['recovery_time_s'] = (recovery_confirmed -
                                  passage_time if result['recovered'] else None)
+    result['recovery_confirmed_before_route_completion'] = (
+        recovery_confirmed_at is not None and completed_at is not None
+        and recovery_confirmed_at < completed_at)
+    result['moving_recovery_before_route_completion'] = (
+        moving_recovery_before_completion)
+    result['terminal_approach_observed'] = any(
+        row.get('terminal_approach_phase') == 'approach' for row in frames)
     result['goal_arrived'] = result['final_goal_error_m'] <= 3.0
     finished = metadata['termination'] == 'goal_stopped'
     recovery_needed = metadata['scenario'] in ('S1', 'S2')
@@ -381,4 +489,78 @@ def evaluate_trial(metadata, frames):
                              and (not recovery_needed or result['recovered']))
     result['verdict'] = ('expected_stop' if result['expected_stop'] else
                          'pass' if result['success'] else 'fail')
+    # Historical motion criteria are preserved. New runs additionally must
+    # confirm safe protocol shutdown; old summaries/files are never rewritten.
+    result['motion_success'] = result['success']
+    if (metadata.get('halt_protocol_version', 1) >= 2
+            and not metadata.get('halt_confirmation_complete', False)):
+        result['success'] = False
+        if result['motion_success']:
+            result['verdict'] = 'shutdown_unconfirmed'
+    result.update(_terminal_alignment_diagnostics(
+        metadata, frames, completed_at, moving_confirmed_at, result))
     return result
+
+
+def _terminal_alignment_diagnostics(metadata, frames, completed_at,
+                                    moving_confirmed_at, result):
+    """Stricter, separate diagnostics: never silently redefine legacy pass.
+
+    These are sampled observations (up to sample-gap uncertainty), NOT exact
+    transport latencies. In particular an unstamped Twist has no source age.
+    """
+    def aligned(row):
+        return (abs(float(row['cross_track_m'])) <= .5
+                and abs(float(row['heading_error_deg'])) <= 5)
+
+    last = frames[-1]
+    final_aligned = aligned(last) and abs(float(last['speed_mps'])) <= .05
+    tail = [row for row in frames if moving_confirmed_at is not None
+            and float(row['sim_time_s']) >= moving_confirmed_at]
+    gaps_valid = all(0 < float(b['sim_time_s']) - float(a['sim_time_s']) <= .5
+                     for a, b in zip(tail, tail[1:]))
+    violations = sum(not aligned(row) for row in tail) if tail else None
+    retained = bool(tail and gaps_valid and not violations and final_aligned
+                    and metadata['termination'] == 'goal_stopped')
+    post = [row for row in frames if completed_at is not None
+            and float(row['sim_time_s']) >= completed_at]
+
+    def first_delay(field, predicate):
+        for row in post:
+            try:
+                value = finite(row[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if predicate(value):
+                return float(row['sim_time_s']) - completed_at
+        return None
+
+    distance = None
+    if post:
+        distance = sum(
+            math.hypot(float(b['truth_x']) - float(a['truth_x']),
+                       float(b['truth_y']) - float(a['truth_y']))
+            for a, b in zip(post, post[1:]))
+    return {
+        'terminal_diagnostics_version': 1,
+        'final_alignment_within_bounds': final_aligned,
+        'moving_recovery_confirmed_elapsed_s': (
+            moving_confirmed_at - float(frames[0]['sim_time_s'])
+            if moving_confirmed_at is not None else None),
+        'post_recovery_alignment_violation_samples': violations,
+        'recovery_retained_until_stop': retained,
+        'aligned_stop_success': (
+            bool(result['success'] and retained)
+            if metadata['scenario'] in ('S1', 'S2') else None),
+        'heading_error_at_route_completion_deg': (
+            float(post[0]['heading_error_deg']) if post else None),
+        'maximum_heading_error_after_route_completion_deg': (
+            max(abs(float(row['heading_error_deg'])) for row in post)
+            if post else None),
+        'completion_to_full_brake_s': first_delay('brake', lambda x: x >= .99),
+        'completion_to_accepted_stop_s': first_delay(
+            'accepted_command_speed_mps', lambda x: 0 <= x <= .02),
+        'completion_to_standstill_s': first_delay(
+            'speed_mps', lambda x: abs(x) <= .05),
+        'post_completion_distance_m': distance,
+    }

@@ -36,6 +36,7 @@ from .far_guide_core import SafetyReplanHold
 from .far_guide_core import SafetyRejectionMonitor
 from .far_guide_core import select_direction_continuity
 from .far_guide_core import select_subgoal
+from .far_guide_core import terminal_approach_target
 from .far_guide_core import should_request_costmap_recovery
 
 
@@ -70,6 +71,10 @@ class FarNav2GuideNode(Node):
         self.declare_parameter('segment_lookahead_m', 12.0)
         self.declare_parameter('final_goal_distance_m', 10.0)
         self.declare_parameter('goal_tangent_max_bias_deg', 20.0)
+        # Disabled for ordinary F9/F10. The isolated experiment can request
+        # an earlier on-route pose before proceeding to the final waypoint.
+        self.declare_parameter('terminal_approach_distance_m', 0.0)
+        self.declare_parameter('terminal_approach_capture_m', 1.0)
         self.declare_parameter('goal_change_tolerance_m', 0.25)
         self.declare_parameter('goal_hold_after_success_s', 1.5)
         self.declare_parameter('retry_delay_s', 1.0)
@@ -224,6 +229,17 @@ class FarNav2GuideNode(Node):
         self.goal_change_tolerance_m = float(
             self.get_parameter('goal_change_tolerance_m').value
         )
+        self.terminal_approach_distance_m = float(
+            self.get_parameter('terminal_approach_distance_m').value)
+        self.terminal_approach_capture_m = float(
+            self.get_parameter('terminal_approach_capture_m').value)
+        terminal_approach_target(
+            (0, 0), (40, 0), 0.0, self.terminal_approach_distance_m,
+            self.terminal_approach_capture_m)
+        self.terminal_approach_passed = False
+        self.terminal_approach_active = False
+        self.terminal_approach_target_xy = None
+        self.terminal_approach_phase = None
         self.goal_hold_after_success_s = float(
             self.get_parameter('goal_hold_after_success_s').value
         )
@@ -543,7 +559,8 @@ class FarNav2GuideNode(Node):
                 'length-only detour retry threshold cannot be negative'
             )
         if self.path_efficiency_topology_escape_after_retries < 1:
-            raise ValueError('topology escape retry threshold must be positive')
+            raise ValueError(
+                'topology escape retry threshold must be positive')
         if min(
             self.path_efficiency_topology_escape_max_length_ratio,
             self.path_efficiency_topology_escape_max_abs_turn_rad,
@@ -616,6 +633,8 @@ class FarNav2GuideNode(Node):
         self.subgoal_publisher = self.create_publisher(
             PoseStamped, '/navigation/far_subgoal', latched_qos
         )
+        self.terminal_approach_publisher = self.create_publisher(
+            String, '/navigation/far_terminal_approach/status', latched_qos)
         self.status_publisher = self.create_publisher(
             String, '/navigation/far_guide_status', latched_qos
         )
@@ -874,6 +893,10 @@ class FarNav2GuideNode(Node):
         if not changed:
             return
         self.goal_generation += 1
+        self.terminal_approach_passed = False
+        self.terminal_approach_active = False
+        self.terminal_approach_target_xy = None
+        self.terminal_approach_phase = None
         self.goal_reached = False
         self.next_plan_wall_time = 0.0
         self.hold_until_wall_time = 0.0
@@ -1256,7 +1279,8 @@ class FarNav2GuideNode(Node):
             round(assessment.path_length_m, 1),
             round(assessment.signed_turn_rad, 1),
         )
-        repeated_signature = signature in self.active_inefficient_plan_signatures
+        repeated_signature = (
+            signature in self.active_inefficient_plan_signatures)
         self.active_inefficient_plan_signatures.add(signature)
         self.path_efficiency_retry_count = min(
             self.path_efficiency_retry_count + 1,
@@ -1614,13 +1638,29 @@ class FarNav2GuideNode(Node):
         continuity_heading, continuity_distance, continuity_weight, _ = (
             self._planning_direction_continuity(now)
         )
+        target, active, passed = terminal_approach_target(
+            start, mission_goal, self.latest_goal_tangent_yaw_rad,
+            self.terminal_approach_distance_m,
+            self.terminal_approach_capture_m, self.terminal_approach_passed)
+        self.terminal_approach_active = active
+        self.terminal_approach_passed = passed
+        self.terminal_approach_target_xy = target if active else None
+        phase = ('approach' if active else 'final' if
+                 self.terminal_approach_distance_m > 0 else 'disabled')
+        if phase != self.terminal_approach_phase:
+            self.terminal_approach_phase = phase
+            self.terminal_approach_publisher.publish(String(data=phase))
+            self._log('terminal_approach_' + phase,
+                      action_status='target={:.3f},{:.3f}'.format(*target))
         return plan_online_guide(
             grid,
             start,
-            mission_goal,
+            target,
             boundary_margin_m=self.boundary_margin_m,
             start_clearance_m=self.start_clearance_m,
-            goal_search_radius_m=self.goal_search_radius_m,
+            # Do not silently snap the rejoin pose into a different lane.
+            goal_search_radius_m=(
+                0.0 if active else self.goal_search_radius_m),
             cost_weight=self.cost_weight,
             maximum_expansions=self.maximum_expansions,
             continuity_heading_rad=continuity_heading,
@@ -1645,10 +1685,27 @@ class FarNav2GuideNode(Node):
                 self.path_efficiency_retry_lookahead_step_m,
                 self.path_efficiency_retry_count,
             )
-        lookahead = min(retry_lookahead, mission_distance)
+        approach_active = self.terminal_approach_active
+        planning_goal = (self.terminal_approach_target_xy
+                         if approach_active else mission_goal)
+        planning_distance = math.hypot(
+            planning_goal[0] - start[0], planning_goal[1] - start[1])
+        lookahead = min(retry_lookahead, planning_distance)
         subgoal, yaw, path_end = select_subgoal(world_path, lookahead)
+        approach_path_length = sum(
+            math.hypot(b[0] - a[0], b[1] - a[1])
+            for a, b in zip(world_path, world_path[1:]))
+        direct_approach = (
+            approach_active and approach_path_length <= retry_lookahead
+            and math.hypot(world_path[-1][0] - planning_goal[0],
+                           world_path[-1][1] - planning_goal[1]) < 0.25)
+        if direct_approach:
+            # Euclidean lookahead can stop short on a bent guide. Once the
+            # whole approach fits this segment, send the actual rejoin pose.
+            subgoal = planning_goal
         direct_final_goal = (
-            mission_distance <= self.final_goal_distance_m
+            not approach_active
+            and mission_distance <= self.final_goal_distance_m
             and (
                 self.path_efficiency_retry_count == 0
                 or mission_distance
@@ -1686,7 +1743,8 @@ class FarNav2GuideNode(Node):
             dy = float(subgoal[1]) - float(start[1])
             if math.hypot(dx, dy) > 0.5:
                 yaw = math.atan2(dy, dx)
-        if self.path_efficiency_escape_mode and self.latest_odometry is not None:
+        if (self.path_efficiency_escape_mode
+                and self.latest_odometry is not None):
             orientation = self.latest_odometry.pose.pose.orientation
             current_yaw = math.atan2(
                 2.0 * (
@@ -1707,6 +1765,15 @@ class FarNav2GuideNode(Node):
                 yaw,
                 self.path_efficiency_escape_max_yaw_change_rad,
             )
+        if approach_active:
+            # This is not mission completion, even when the guide ends here.
+            path_end = False
+            if direct_approach or math.hypot(
+                    subgoal[0] - planning_goal[0],
+                    subgoal[1] - planning_goal[1]) < 0.25:
+                # Specify a forward terminal pose early enough for a feasible
+                # lane return. Do not relax it on retry and call that rejoin.
+                yaw = self.latest_goal_tangent_yaw_rad
         return subgoal, yaw, path_end
 
     def _tick(self):

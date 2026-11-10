@@ -78,7 +78,8 @@ def bounded_heading_preference(
     reference = float(reference_yaw_rad)
     preferred = float(preferred_yaw_rad)
     maximum = float(maximum_bias_rad)
-    if not all(math.isfinite(value) for value in (reference, preferred, maximum)):
+    if not all(math.isfinite(value)
+               for value in (reference, preferred, maximum)):
         raise ValueError('heading values must be finite')
     if maximum < 0.0:
         raise ValueError('maximum heading bias cannot be negative')
@@ -296,7 +297,8 @@ class SafetyReplanHold:
             raise ValueError('safety replan hold time must be finite')
         if self.clear_count >= self.required_clear_confirmations:
             return 'clear_confirmed'
-        if self.started_s is None or now - self.started_s >= self.maximum_hold_s:
+        if (self.started_s is None
+                or now - self.started_s >= self.maximum_hold_s):
             return 'timeout'
         return None
 
@@ -513,7 +515,8 @@ def assess_path_efficiency(
     reasons = []
     enough_reference = reference_length >= minimum_reference_length_m
     enough_excess = path_length - reference_length >= minimum_excess_length_m
-    if enough_reference and enough_excess and length_ratio > maximum_length_ratio:
+    if (enough_reference and enough_excess
+            and length_ratio > maximum_length_ratio):
         reasons.append('length_ratio')
     if (
         enough_reference
@@ -1251,6 +1254,35 @@ def visibility_prune(grid: GuideGrid, path: Sequence[GridCell]):
         result.append(path[farthest])
         anchor = farthest
     return result
+
+
+def terminal_approach_target(
+    start, goal, route_yaw, distance_m, capture_m, already_passed=False,
+):
+    """Opt-in virtual rejoin pose; never send a passed checkpoint backwards.
+
+    This uses navigation inputs only, not truth or obstacle fixture geometry.
+    The plane transition is a planning stage, NOT evidence of aligned recovery.
+    Smac and the independent path/LiDAR gates still validate every action.
+    """
+    if not math.isfinite(distance_m) or distance_m < 0:
+        raise ValueError(
+            'terminal approach distance must be finite/nonnegative')
+    if distance_m == 0:
+        return goal, False, False
+    if (route_yaw is None or not math.isfinite(route_yaw)
+            or not math.isfinite(capture_m) or capture_m <= 0
+            or capture_m >= distance_m):
+        raise ValueError('terminal approach needs a tangent and valid capture')
+    forward = math.cos(route_yaw), math.sin(route_yaw)
+    remaining = ((goal[0] - start[0]) * forward[0]
+                 + (goal[1] - start[1]) * forward[1])
+    passed = already_passed or remaining <= distance_m + capture_m
+    if passed:
+        return goal, False, True
+    target = (goal[0] - distance_m * forward[0],
+              goal[1] - distance_m * forward[1])
+    return target, True, False
 
 
 def select_subgoal(

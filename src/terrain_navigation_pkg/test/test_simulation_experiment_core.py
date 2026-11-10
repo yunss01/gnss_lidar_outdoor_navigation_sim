@@ -18,13 +18,20 @@ from terrain_navigation_pkg.simulation_experiment_core import (
 
 def anchor():
     return {
-        'schema_version': 1,
-        'map_name': 'Town',
-        'vehicle_blueprint': 'vehicle.lincoln.mkz_2020',
-        'start_carla': dict(x=0, y=0, z=1, yaw=0, pitch=0, roll=0),
-        'route_length_m': 40,
-        'obstacle_distance_m': 20,
-        'corridor_half_width_m': 7,
+        'schema_version':
+        1,
+        'map_name':
+        'Town',
+        'vehicle_blueprint':
+        'vehicle.lincoln.mkz_2020',
+        'start_carla':
+        dict(x=0, y=0, z=1, yaw=0, pitch=0, roll=0),
+        'route_length_m':
+        40,
+        'obstacle_distance_m':
+        20,
+        'corridor_half_width_m':
+        7,
         'waypoints': [
             dict(latitude=0, longitude=0, altitude=0),
             dict(latitude=0, longitude=0.001, altitude=0)
@@ -86,6 +93,141 @@ def test_nonfinite_anchor_is_rejected():
     invalid['start_carla']['yaw'] = math.nan
     with pytest.raises(ValueError):
         validate_anchor(invalid)
+
+
+def test_arrival_diagnostics_do_not_relax_or_replace_recovery_scoring():
+    frames = recovered_frames()
+    metadata = dict(meta(),
+                    requested_arrival_radius_m=1.0,
+                    active_arrival_radius_m=1.0,
+                    arrival_radius_verified=True)
+    for frame in frames:
+        frame.update(navigation_goal_distance_m=0.8,
+                     navigation_goal_reached=1,
+                     navigation_goal_distance_age_s=0.1,
+                     navigation_goal_reached_age_s=0.1,
+                     route_status='completed')
+    result = evaluate_trial(metadata, frames)
+    assert result['success'] and result['arrival_radius_verified']
+    assert result['minimum_navigation_goal_distance_m'] == 0.8
+    assert result['navigation_goal_reached_observed']
+    assert result['route_completed_observed']
+    for frame in frames:
+        frame['heading_error_deg'] = 12.5
+    assert not evaluate_trial(metadata, frames)['success']
+
+
+def test_missing_or_stale_arrival_diagnostics_do_not_claim_control_arrival():
+    legacy = evaluate_trial(meta(), recovered_frames())
+    assert legacy['active_arrival_radius_m'] is None
+    assert legacy['minimum_navigation_goal_distance_m'] is None
+    assert not legacy['navigation_goal_reached_observed']
+    frames = recovered_frames()
+    for frame in frames:
+        frame.update(navigation_goal_distance_m=0.2,
+                     navigation_goal_reached=1,
+                     navigation_goal_distance_age_s=10,
+                     navigation_goal_reached_age_s=10)
+    stale = evaluate_trial(meta(), frames)
+    assert stale['minimum_navigation_goal_distance_m'] is None
+    assert not stale['navigation_goal_reached_observed']
+    assert stale['success'] == legacy[
+        'success']  # Diagnostics, not new scoring.
+
+
+def test_initial_waypoint_arrival_is_not_final_goal_evidence():
+    frames = recovered_frames()
+    for frame in frames:
+        near_final = frame['goal_error_m'] <= 3.0
+        frame.update(
+            navigation_goal_distance_m=1.8 if near_final else 0.0,
+            navigation_goal_reached=0 if near_final else 1,
+            navigation_goal_distance_age_s=0.1,
+            navigation_goal_reached_age_s=0.1)
+    result = evaluate_trial(meta(), frames)
+    assert result['minimum_navigation_goal_distance_m'] == 1.8
+    assert not result['navigation_goal_reached_observed']
+
+
+def test_motion_pass_cannot_hide_unconfirmed_new_shutdown():
+    metadata = dict(meta(), halt_protocol_version=2,
+                    halt_confirmation_complete=False)
+    result = evaluate_trial(metadata, recovered_frames())
+    assert result['motion_success']
+    assert not result['success']
+    assert result['verdict'] == 'shutdown_unconfirmed'
+    metadata['halt_confirmation_complete'] = True
+    assert evaluate_trial(metadata, recovered_frames())['success']
+
+
+@pytest.mark.parametrize('mode', ['moving', 'coasting', 'stationary'])
+def test_early_moving_recovery_excludes_stopped_or_late_alignment(mode):
+    frames = []
+    for i in range(100):
+        frames.append(row(
+            i / 10, along=min(40, 26 + i / 5),
+            speed=1 if mode != 'stationary' and i < 70 else 0,
+            heading_error_deg=12 if mode == 'coasting' and i < 60 else 0,
+            route_status='navigating' if i < 60 else 'completed'))
+    result = evaluate_trial(meta(), frames)
+    assert result['recovered']  # Historical criterion includes stopped holds.
+    assert result['moving_recovery_before_route_completion'] == (
+        mode == 'moving')
+    assert result['recovery_confirmed_before_route_completion'] == (
+        mode != 'coasting')
+
+
+@pytest.mark.parametrize('case', [
+    'retained', 'terminal_departure', 'returned_after_departure',
+    'stationary_only', 'sample_gap', 'shutdown_missing', 'no_completion',
+])
+def test_aligned_stop_does_not_hide_later_departure_or_stopped_recovery(case):
+    frames = [row(i / 10, along=min(40, 26 + i / 5),
+                  speed=1 if i < 70 else 0,
+                  route_status=('navigating' if i < 60 else 'completed'),
+                  brake=1 if i >= 65 else 0)
+              for i in range(91)]
+    metadata = dict(meta(), halt_protocol_version=2,
+                    halt_confirmation_complete=case != 'shutdown_missing')
+    if case in ('terminal_departure', 'returned_after_departure'):
+        for frame in frames[65:]:
+            frame['heading_error_deg'] = 8
+        if case == 'returned_after_departure':
+            for frame in frames[75:]:
+                frame['heading_error_deg'] = 0
+    if case == 'stationary_only':
+        for frame in frames[:70]:
+            frame['heading_error_deg'] = 12
+    if case == 'sample_gap':
+        del frames[35:45]
+    if case == 'no_completion':
+        for frame in frames:
+            frame['route_status'] = 'navigating'
+    result = evaluate_trial(metadata, frames)
+    assert result['recovery_retained_until_stop'] == (
+        case in ('retained', 'shutdown_missing'))
+    assert result['aligned_stop_success'] == (case == 'retained')
+    if case in ('terminal_departure', 'returned_after_departure'):
+        assert result['success']  # Preserve the historical latched contract.
+        assert result['post_recovery_alignment_violation_samples'] > 0
+    if case != 'no_completion':
+        assert result['completion_to_full_brake_s'] == pytest.approx(.5)
+        assert result['completion_to_standstill_s'] == pytest.approx(1)
+        assert result['post_completion_distance_m'] == pytest.approx(2)
+    else:
+        assert result['completion_to_standstill_s'] is None
+    assert result['completion_to_accepted_stop_s'] is None
+
+
+def test_terminal_accepted_command_is_distinct_from_recorder_twist():
+    frames = [row(i / 10, along=39, speed=0,
+                  route_status='completed', command_speed_mps=0,
+                  accepted_command_speed_mps=1 if i < 5 else 0,
+                  brake=0 if i < 5 else 1)
+              for i in range(21)]
+    result = evaluate_trial(meta(), frames)
+    assert result['completion_to_accepted_stop_s'] == pytest.approx(.5)
+    assert result['completion_to_full_brake_s'] == pytest.approx(.5)
 
 
 def test_pose_bias_is_off_at_anchor_then_ramps_in():
@@ -329,7 +471,10 @@ def test_missing_final_gate_state_is_invalid_even_when_parked():
 
 def test_blocked_stop_accepts_unchanged_gate_event_with_live_safety():
     frames = [
-        row(i / 10, along=12, speed=0, safety_state='obstacle_stop',
+        row(i / 10,
+            along=12,
+            speed=0,
+            safety_state='obstacle_stop',
             path_gate_age_s=60) for i in range(121)
     ]
     summary = evaluate_trial(meta('S3', 'blocked_stopped'), frames)
